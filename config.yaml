@@ -1,0 +1,18 @@
+server:
+  host: "0.0.0.0"
+  port: 8888
+
+models:
+  aliases:
+    cheap: "openrouter/minimax/minimax-m2.5"
+    medium: "openrouter/minimax/minimax-m2.5"
+    strong: "openrouter/minimax/minimax-m2.5"
+    auto: "openrouter/minimax/minimax-m2.5"
+  default: "cheap"
+
+tracking:
+  db: "tracking.db"
+  enabled: true
+
+logging:
+  level: "INFO"
