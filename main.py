@@ -16,9 +16,13 @@ load_dotenv(os.path.join(_HERE, ".env"))
 def main() -> None:
     config = ProxyConfig.load(os.path.join(_HERE, "config.yaml"))
 
-    logging_level = logging.INFO
+    # Allow env vars to override config.yaml server settings
+    host = os.getenv("PROXY_HOST", config.server.host)
+    port = int(os.getenv("PROXY_PORT", str(config.server.port)))
+
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging_level,
+        level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
@@ -28,7 +32,8 @@ def main() -> None:
     tracker = RequestTracker(db_path) if config.tracking.enabled else None
     app = create_app(config, tracker)
 
-    uvicorn.run(app, host=config.server.host, port=config.server.port)
+    logging.getLogger(__name__).info(f"thrift-flow listening on http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
