@@ -2,12 +2,29 @@ server:
   host: "0.0.0.0"
   port: 8888
 
+# ── Model aliases ──────────────────────────────────────────────────────────────
+# Map tier names (cheap / medium / strong / auto) to real LiteLLM model names.
+# The model name prefix determines the provider — no other config needed.
+# Set the corresponding API key in .env.
+#
+# Provider prefix reference:
+#   openrouter/org/model-name   → OPENROUTER_API_KEY
+#   groq/model-name             → GROQ_API_KEY
+#   anthropic/model-name        → ANTHROPIC_API_KEY
+#   openai/model-name           → OPENAI_API_KEY
+#   gemini/model-name           → GEMINI_API_KEY
+#   together_ai/model-name      → TOGETHERAI_API_KEY
+#
+# Example multi-provider setup (Phase 2):
+#   cheap:  "groq/llama-3.1-8b-instant"
+#   medium: "openrouter/qwen/qwen3-235b-a22b"
+#   strong: "anthropic/claude-sonnet-4-5"
 models:
   aliases:
-    cheap: "openrouter/minimax/minimax-m2.5"
+    cheap:  "openrouter/minimax/minimax-m2.5"
     medium: "openrouter/minimax/minimax-m2.5"
     strong: "openrouter/minimax/minimax-m2.5"
-    auto: "openrouter/minimax/minimax-m2.5"
+    auto:   "openrouter/minimax/minimax-m2.5"   # Phase 2: routing will pick tier dynamically
   default: "cheap"
 
 tracking:
