@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 
 class RequestTracker:
@@ -34,10 +35,18 @@ class RequestTracker:
         self._lock = threading.Lock()
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._lock:
@@ -45,7 +54,6 @@ class RequestTracker:
                 conn.execute(self._CREATE_TABLE)
                 conn.execute(self._CREATE_INDEX_TS)
                 conn.execute(self._CREATE_INDEX_CLIENT)
-                conn.commit()
 
     def log_request(
         self,
@@ -88,7 +96,6 @@ class RequestTracker:
                         error,
                     ),
                 )
-                conn.commit()
                 return cursor.lastrowid  # type: ignore[return-value]
 
     def get_summary(self) -> dict[str, Any]:

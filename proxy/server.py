@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Optional
@@ -52,7 +53,7 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
         model_requested: str = body.get("model", config.models.default)
         model_resolved: str = config.resolve_model(model_requested)
         messages: list[dict] = body.get("messages", [])
-        is_streaming: bool = bool(body.get("stream", False))
+        is_streaming: bool = body.get("stream") is True
 
         # Count input tokens
         input_tokens = 0
@@ -72,25 +73,32 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
                 cost_usd = 0.0
                 status = 200
                 error_msg = None
+                stream_done = False  # Fix 8: track normal stream completion
 
                 try:
                     async for sse_str, tok, cost in stream_completion(
                         model_resolved, messages, body
                     ):
                         yield sse_str.encode()
-                        if tok > 0 or cost > 0:
+                        if sse_str.startswith("data: [DONE]"):  # Fix 9: reliable DONE detection
                             output_tokens = tok
                             cost_usd = cost
+                            stream_done = True
                 except Exception as exc:
                     logger.exception("Streaming error")
                     status = 500
                     error_msg = str(exc)
                     yield b"data: [DONE]\n\n"
                 finally:
+                    # Fix 8: GeneratorExit (client disconnect) bypasses except-Exception above;
+                    # stream_done=False and status=200 together identify a client disconnect.
+                    if not stream_done and status == 200:
+                        status = 499  # Client Closed Request
                     latency_ms = (time.monotonic() - start_time) * 1000
                     if tracker is not None:
                         try:
-                            tracker.log_request(
+                            await asyncio.to_thread(  # Fix 5: don't block the event loop
+                                tracker.log_request,
                                 model_requested=model_requested,
                                 model_resolved=model_resolved,
                                 input_tokens=input_tokens,
@@ -123,19 +131,23 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
                 latency_ms = (time.monotonic() - start_time) * 1000
 
                 if tracker is not None:
-                    tracker.log_request(
-                        model_requested=model_requested,
-                        model_resolved=model_resolved,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cost_usd=cost_usd,
-                        latency_ms=latency_ms,
-                        streaming=False,
-                        status=200,
-                        error=None,
-                        client_id=client_id,
-                        session_key=session_key,
-                    )
+                    try:  # Fix 3: don't let a tracker failure destroy a successful response
+                        await asyncio.to_thread(  # Fix 5: non-blocking
+                            tracker.log_request,
+                            model_requested=model_requested,
+                            model_resolved=model_resolved,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            cost_usd=cost_usd,
+                            latency_ms=latency_ms,
+                            streaming=False,
+                            status=200,
+                            error=None,
+                            client_id=client_id,
+                            session_key=session_key,
+                        )
+                    except Exception:
+                        logger.exception("Failed to log request")
 
                 return JSONResponse(content=response_dict)
 
@@ -147,7 +159,8 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
 
                 if tracker is not None:
                     try:
-                        tracker.log_request(
+                        await asyncio.to_thread(  # Fix 5: non-blocking
+                            tracker.log_request,
                             model_requested=model_requested,
                             model_resolved=model_resolved,
                             input_tokens=input_tokens,

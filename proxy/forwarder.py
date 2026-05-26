@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from typing import Any, AsyncIterator
 
 import litellm
@@ -86,11 +87,15 @@ async def stream_completion(
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[Any] = asyncio.Queue()
+    stop_event = threading.Event()  # signals worker to stop on client disconnect
 
     def _worker() -> None:
+        signalled = False
         try:
             response_iter = litellm.completion(**kwargs)
             for chunk in response_iter:
+                if stop_event.is_set():  # Fix 2: stop consuming on disconnect
+                    break
                 chunk_dict = (
                     chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
                 )
@@ -100,10 +105,24 @@ async def stream_completion(
             asyncio.run_coroutine_threadsafe(
                 queue.put(("done", None)), loop
             ).result()
+            signalled = True
         except Exception as exc:
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("error", str(exc))), loop
-            ).result()
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(("error", str(exc))), loop
+                ).result()
+                signalled = True
+            except Exception:
+                pass
+        finally:
+            # Fix 1: always unblock consumer, even on BaseException (KeyboardInterrupt etc.)
+            if not signalled:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put(("error", "worker terminated unexpectedly")), loop
+                    ).result(timeout=1.0)
+                except Exception:
+                    pass
 
     thread = asyncio.to_thread(_worker)
     task = asyncio.ensure_future(thread)
@@ -151,6 +170,7 @@ async def stream_completion(
             elif kind == "error":
                 raise RuntimeError(payload)
     finally:
+        stop_event.set()  # Fix 2: signal worker to stop
         task.cancel()
         try:
             await task

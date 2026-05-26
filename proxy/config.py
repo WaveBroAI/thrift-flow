@@ -35,7 +35,7 @@ class ProxyConfig:
     @classmethod
     def load(cls, path: str = "config.yaml") -> "ProxyConfig":
         with open(path, "r") as f:
-            raw = yaml.safe_load(f)
+            raw = yaml.safe_load(f) or {}
 
         server_raw = raw.get("server", {})
         server = ServerConfig(
