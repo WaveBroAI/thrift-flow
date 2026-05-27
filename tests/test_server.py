@@ -273,6 +273,48 @@ def test_streaming_logs_to_tracker(client, tracker):
     assert recent[0]["input_tokens"] == 8    # from mocked token_counter
 
 
+async def _mock_stream_gen_error_after_done():
+    """Yields content + [DONE] with token counts, then raises — simulating Fix #3 path."""
+    chunk = json.dumps({
+        "id": "test-456",
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {"content": "Partial"}, "finish_reason": None}],
+    })
+    yield f"data: {chunk}\n\n", 0, 0.0
+    yield "data: [DONE]\n\n", 5, 0.0002
+    raise RuntimeError("provider exploded after DONE")
+
+
+def test_streaming_error_after_done_logs_status_500_with_tokens(client, tracker):
+    """Fix #3: when stream_completion yields [DONE] then raises, tracker records
+    status=500, correct output_tokens (from [DONE] payload), and the error message.
+    The client must receive exactly one [DONE] in the response body."""
+    with (
+        patch("proxy.server.stream_completion", return_value=_mock_stream_gen_error_after_done()),
+        patch("litellm.token_counter", return_value=8),
+    ):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "cheap",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
+        )
+
+    assert resp.status_code == 200  # HTTP envelope is always 200 for SSE
+    # Exactly one [DONE] sentinel — server must NOT emit a second one
+    done_count = resp.text.count("data: [DONE]")
+    assert done_count == 1, f"Expected exactly 1 [DONE], got {done_count}"
+
+    recent = tracker.get_recent(limit=1)
+    assert len(recent) == 1
+    rec = recent[0]
+    assert rec["status"] == 500, "Provider error after [DONE] must be logged as status 500"
+    assert rec["output_tokens"] == 5, "output_tokens must be captured from the [DONE] payload"
+    assert rec["error"] is not None and "provider exploded" in rec["error"]
+
+
 # ── usage endpoints ───────────────────────────────────────────────────────────
 
 def test_usage_summary_endpoint(client, tracker):

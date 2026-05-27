@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, AsyncIterator
@@ -185,12 +186,15 @@ async def stream_completion(
         _stream_error = exc
     finally:
         # Fix #5: explicit close to ensure HTTP transport is released.
-        # BaseException (not just Exception) is suppressed here so that
-        # CancelledError during cleanup does not mask the original error.
+        # Exception + CancelledError are suppressed so cleanup errors don't
+        # mask the original _stream_error.  SystemExit/KeyboardInterrupt propagate.
         if hasattr(_acomp, "aclose"):
             try:
                 await _acomp.aclose()
-            except BaseException:
+            except (Exception, asyncio.CancelledError):
+                # Suppress errors during cleanup — CancelledError on client disconnect
+                # and provider errors from close() must not mask the original _stream_error.
+                # SystemExit / KeyboardInterrupt are intentionally NOT caught here.
                 pass
 
     # Emit [DONE] with final cost for both success and provider-error paths.
@@ -202,4 +206,9 @@ async def stream_completion(
     yield "data: [DONE]\n\n", output_tokens, cost_usd
 
     if _stream_error is not None:
+        # Re-raise after yielding [DONE] so the consumer (server._generate) can
+        # log status=500 and optionally emit a second [DONE] guard.  This only
+        # propagates when the consumer calls __anext__() again after receiving
+        # [DONE] — server._generate's async-for loop does exactly that, so the
+        # except-Exception branch in _generate is the intended receiver.
         raise _stream_error
