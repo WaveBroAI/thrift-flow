@@ -115,6 +115,8 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
                                 client_id=client_id,
                                 session_key=session_key,
                             ))
+                        except asyncio.CancelledError:
+                            pass  # expected on client disconnect; shielded tracker write continues
                         except BaseException:
                             logger.exception("Failed to log streaming request")
 

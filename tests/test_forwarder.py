@@ -218,3 +218,134 @@ def test_mid_stream_exception_does_not_emit_duplicate_done():
 
     done_count = sum(1 for item in collected if item[0] == "data: [DONE]\n\n")
     assert done_count == 1, f"Expected exactly 1 [DONE], got {done_count}"
+
+
+# ── Regression: null placeholder in tool_calls array (CONFIRMED bug #1) ──────
+
+def test_null_entry_in_tool_calls_does_not_abort_stream():
+    """A None placeholder in tool_calls must be skipped, not crash the stream."""
+    chunks = [
+        # tool_calls list with a null entry followed by a real entry
+        _make_chunk(tool_calls=[None, {"function": {"name": "get_weather", "arguments": '{"city":"SF"}'}}]),
+        _make_chunk(content="Done"),
+    ]
+    acomp = _AsyncIter(chunks)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", return_value=4),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await _collect(_MODEL, _MESSAGES, {})
+
+    results = asyncio.run(_run())
+
+    # 2 intermediate chunks + 1 DONE — stream must NOT have aborted early
+    assert len(results) == 3, (
+        f"Expected 3 items (2 chunks + DONE), got {len(results)} — "
+        "null tool_calls entry likely caused an early abort"
+    )
+    done_sse, _, _ = results[-1]
+    assert done_sse == "data: [DONE]\n\n"
+
+
+def test_null_only_tool_calls_list_does_not_abort_stream():
+    """A tool_calls list containing only None entries must not crash the stream."""
+    chunks = [_make_chunk(tool_calls=[None, None])]
+    acomp = _AsyncIter(chunks)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", return_value=0),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await _collect(_MODEL, _MESSAGES, {})
+
+    results = asyncio.run(_run())
+    assert results[-1][0] == "data: [DONE]\n\n"
+
+
+# ── Regression: partial provider_usage (CONFIRMED bug #2) ────────────────────
+
+def test_partial_provider_usage_missing_completion_tokens_falls_back():
+    """When provider_usage lacks completion_tokens, token_counter is used for output side."""
+    chunks = [
+        _make_chunk(usage={"prompt_tokens": 10}),  # no completion_tokens
+    ]
+    acomp = _AsyncIter(chunks)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", return_value=7),  # fallback value
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await _collect(_MODEL, _MESSAGES, {})
+
+    results = asyncio.run(_run())
+
+    _, output_tokens, _ = results[-1]
+    assert output_tokens == 7, (
+        "output_tokens must fall back to token_counter (7) when completion_tokens "
+        "is absent from provider_usage, not silently zero"
+    )
+
+
+def test_partial_provider_usage_missing_prompt_tokens_falls_back():
+    """When provider_usage lacks prompt_tokens, cost calculation uses token_counter for input."""
+    chunks = [
+        _make_chunk(usage={"completion_tokens": 20}),  # no prompt_tokens
+    ]
+    acomp = _AsyncIter(chunks)
+
+    cost_captured = []
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", return_value=5),
+            # Use a model with known rates so we can verify cost > 0
+            patch("litellm.get_model_info", return_value={
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+            }),
+        ):
+            async for sse, tok, cost in stream_completion(_MODEL, _MESSAGES, {}):
+                if sse == "data: [DONE]\n\n":
+                    cost_captured.append((tok, cost))
+
+    asyncio.run(_run())
+
+    assert cost_captured, "No [DONE] tuple captured"
+    output_tokens, cost_usd = cost_captured[0]
+    assert output_tokens == 20, "output_tokens should come from provider (20)"
+    # cost = (fallback_input=5 * 0.001) + (provider_output=20 * 0.002) = 0.045
+    assert cost_usd > 0, (
+        "cost_usd must be > 0 when prompt_tokens falls back to token_counter"
+    )
+
+
+def test_non_numeric_provider_usage_falls_back_to_token_counter():
+    """Non-numeric completion_tokens must fall back gracefully, not raise ValueError."""
+    chunks = [
+        _make_chunk(usage={"prompt_tokens": "bad", "completion_tokens": "abc"}),
+    ]
+    acomp = _AsyncIter(chunks)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", return_value=6),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await _collect(_MODEL, _MESSAGES, {})
+
+    # Must not raise ValueError — should complete and return token_counter fallback
+    results = asyncio.run(_run())
+    assert results[-1][0] == "data: [DONE]\n\n"
+    _, output_tokens, _ = results[-1]
+    assert output_tokens == 6, (
+        "Non-numeric provider usage must fall back to token_counter (6), not crash"
+    )
