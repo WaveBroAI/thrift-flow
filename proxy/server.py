@@ -89,7 +89,8 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
                     logger.exception("Streaming error")
                     status = 500
                     error_msg = str(exc)
-                    yield b"data: [DONE]\n\n"
+                    if not stream_done:  # Fix #3: stream_completion may have already yielded [DONE]
+                        yield b"data: [DONE]\n\n"
                 finally:
                     # Fix 8: GeneratorExit (client disconnect) bypasses except-Exception above;
                     # stream_done=False and status=200 together identify a client disconnect.
