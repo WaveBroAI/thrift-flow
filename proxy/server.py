@@ -53,7 +53,8 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
         model_requested: str = body.get("model", config.models.default)
         model_resolved: str = config.resolve_model(model_requested)
         messages: list[dict] = body.get("messages", [])
-        is_streaming: bool = body.get("stream") is True
+        _stream = body.get("stream")
+        is_streaming: bool = _stream is True or _stream == 1  # Fix C: accept numeric 1
 
         # Count input tokens
         input_tokens = 0
@@ -79,11 +80,11 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
                     async for sse_str, tok, cost in stream_completion(
                         model_resolved, messages, body
                     ):
-                        yield sse_str.encode()
-                        if sse_str.startswith("data: [DONE]"):  # Fix 9: reliable DONE detection
+                        if sse_str.startswith("data: [DONE]"):  # Fix D: set before yield to avoid race
                             output_tokens = tok
                             cost_usd = cost
                             stream_done = True
+                        yield sse_str.encode()
                 except Exception as exc:
                     logger.exception("Streaming error")
                     status = 500
@@ -97,7 +98,9 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
                     latency_ms = (time.monotonic() - start_time) * 1000
                     if tracker is not None:
                         try:
-                            await asyncio.to_thread(  # Fix 5: don't block the event loop
+                            # Fix A: shield protects the log write from CancelledError on disconnect;
+                            # except BaseException catches CancelledError (inherits BaseException, not Exception)
+                            await asyncio.shield(asyncio.to_thread(
                                 tracker.log_request,
                                 model_requested=model_requested,
                                 model_resolved=model_resolved,
@@ -110,8 +113,8 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
                                 error=error_msg,
                                 client_id=client_id,
                                 session_key=session_key,
-                            )
-                        except Exception:
+                            ))
+                        except BaseException:
                             logger.exception("Failed to log streaming request")
 
             return StreamingResponse(
@@ -182,18 +185,18 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
     async def usage_summary() -> dict[str, Any]:
         if tracker is None:
             return {"tracking_enabled": False}
-        return tracker.get_summary()
+        return await asyncio.to_thread(tracker.get_summary)  # Fix B: don't block the event loop
 
     @app.get("/v1/usage/by-model")
     async def usage_by_model() -> list[dict[str, Any]]:
         if tracker is None:
             return []
-        return tracker.get_by_model()
+        return await asyncio.to_thread(tracker.get_by_model)  # Fix B
 
     @app.get("/v1/usage/recent")
     async def usage_recent(limit: int = 50) -> list[dict[str, Any]]:
         if tracker is None:
             return []
-        return tracker.get_recent(limit=limit)
+        return await asyncio.to_thread(tracker.get_recent, limit)  # Fix B
 
     return app

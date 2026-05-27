@@ -214,6 +214,26 @@ def test_streaming_content_type(client):
     assert "text/event-stream" in resp.headers["content-type"]
 
 
+def test_streaming_numeric_one_triggers_sse(client):
+    """Fix C: {"stream": 1} must be treated as streaming (not just {"stream": True})."""
+    with (
+        patch("proxy.server.stream_completion", return_value=_mock_stream_gen()),
+        patch("litellm.token_counter", return_value=8),
+    ):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "cheap",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": 1,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    assert "data: [DONE]" in resp.text
+
+
 def test_streaming_body_contains_done_sentinel(client):
     with (
         patch("proxy.server.stream_completion", return_value=_mock_stream_gen()),
