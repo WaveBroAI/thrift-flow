@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import threading
 from typing import Any, AsyncIterator
 
 import litellm
@@ -26,7 +24,7 @@ _PASSTHROUGH_FIELDS = (
 
 
 def _build_kwargs(model: str, messages: list[dict], body: dict) -> dict[str, Any]:
-    """Build the kwargs dict for a litellm.completion call."""
+    """Build the kwargs dict for a litellm.acompletion call."""
     kwargs: dict[str, Any] = {"model": model, "messages": messages}
     for field in _PASSTHROUGH_FIELDS:
         if field in body:
@@ -56,7 +54,8 @@ async def call_non_streaming(
     """
     kwargs = _build_kwargs(model, messages, body)
 
-    response = await asyncio.to_thread(litellm.completion, **kwargs)
+    # Fix E+F: use native async acompletion — no thread, no queue, no blocking I/O
+    response = await litellm.acompletion(**kwargs)
 
     output_tokens: int = 0
     if response.usage and response.usage.completion_tokens:
@@ -81,98 +80,37 @@ async def stream_completion(
     Each yielded tuple is (sse_string, output_tokens, cost_usd).
     - For intermediate chunks: output_tokens=0, cost_usd=0.
     - For the final "data: [DONE]\\n\\n" item: real output_tokens and cost_usd.
+
+    Fix E+F: replaced the thread+queue+stop_event pattern with native
+    litellm.acompletion async streaming.  Client disconnect cancels the
+    async generator directly — no OS thread left running in the background,
+    no unbounded queue accumulating the full response in memory.
     """
     kwargs = _build_kwargs(model, messages, body)
     kwargs["stream"] = True
 
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[Any] = asyncio.Queue()
-    stop_event = threading.Event()  # signals worker to stop on client disconnect
-
-    def _worker() -> None:
-        signalled = False
-        try:
-            response_iter = litellm.completion(**kwargs)
-            for chunk in response_iter:
-                if stop_event.is_set():  # Fix 2: stop consuming on disconnect
-                    break
-                chunk_dict = (
-                    chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
-                )
-                asyncio.run_coroutine_threadsafe(
-                    queue.put(("chunk", chunk_dict)), loop
-                ).result()
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("done", None)), loop
-            ).result()
-            signalled = True
-        except Exception as exc:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    queue.put(("error", str(exc))), loop
-                ).result()
-                signalled = True
-            except Exception:
-                pass
-        finally:
-            # Fix 1: always unblock consumer, even on BaseException (KeyboardInterrupt etc.)
-            if not signalled:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        queue.put(("error", "worker terminated unexpectedly")), loop
-                    ).result(timeout=1.0)
-                except Exception:
-                    pass
-
-    thread = asyncio.to_thread(_worker)
-    task = asyncio.ensure_future(thread)
-
     accumulated_text = ""
 
+    async for chunk in await litellm.acompletion(**kwargs):
+        chunk_dict = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
+        sse_line = f"data: {json.dumps(chunk_dict)}\n\n"
+        for choice in chunk_dict.get("choices", []):
+            delta = choice.get("delta", {})
+            accumulated_text += delta.get("content") or ""
+        yield sse_line, 0, 0.0
+
+    # All chunks consumed — compute cost and emit DONE
+    output_tokens = 0
     try:
-        while True:
-            item = await queue.get()
-            kind, payload = item
+        output_tokens = litellm.token_counter(model=model, text=accumulated_text)
+    except Exception:
+        output_tokens = 0
 
-            if kind == "chunk":
-                sse_line = f"data: {json.dumps(payload)}\n\n"
-                # Accumulate generated text for token counting
-                choices = payload.get("choices", [])
-                for choice in choices:
-                    delta = choice.get("delta", {})
-                    content = delta.get("content") or ""
-                    accumulated_text += content
-                yield sse_line, 0, 0.0
+    input_rate, output_rate = _get_cost_rates(model)
+    try:
+        input_tokens_est = litellm.token_counter(model=model, messages=messages)
+    except Exception:
+        input_tokens_est = 0
+    cost_usd = (input_tokens_est * input_rate) + (output_tokens * output_rate)
 
-            elif kind == "done":
-                # Count output tokens from accumulated text
-                output_tokens = 0
-                try:
-                    output_tokens = litellm.token_counter(
-                        model=model, text=accumulated_text
-                    )
-                except Exception:
-                    output_tokens = 0
-
-                input_rate, output_rate = _get_cost_rates(model)
-                # Estimate input tokens for cost; server has the authoritative count
-                try:
-                    input_tokens_est = litellm.token_counter(
-                        model=model, messages=messages
-                    )
-                except Exception:
-                    input_tokens_est = 0
-                cost_usd = (input_tokens_est * input_rate) + (output_tokens * output_rate)
-
-                yield "data: [DONE]\n\n", output_tokens, cost_usd
-                break
-
-            elif kind == "error":
-                raise RuntimeError(payload)
-    finally:
-        stop_event.set()  # Fix 2: signal worker to stop
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+    yield "data: [DONE]\n\n", output_tokens, cost_usd
