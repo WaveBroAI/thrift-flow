@@ -33,3 +33,24 @@ tracking:
 
 logging:
   level: "INFO"
+
+# ── Adaptive Model Routing (Phase 2) ───────────────────────────────────────────
+# Disabled by default.  Requires model: "auto" wiring in server.py (PR B) to
+# have any effect on routing decisions.
+#
+# To enable:
+#   1. Set enabled: true
+#   2. Set categorizer_model to a fast cheap LLM (Groq recommended for ~220ms)
+#   3. Set categorizer_api_key_env to the env var holding the API key
+#   4. Ensure the key is exported: export GROQ_API_KEY=gsk_...
+#
+# categorizer_model examples:
+#   "groq/llama-3.1-8b-instant"          — fastest, ~220ms, requires GROQ_API_KEY
+#   "openrouter/meta-llama/llama-3.1-8b" — fallback via OpenRouter
+routing:
+  enabled: false
+  categorizer_model: null            # e.g. "groq/llama-3.1-8b-instant"
+  categorizer_api_base: null         # custom endpoint; null = litellm default
+  categorizer_api_key_env: null      # e.g. "GROQ_API_KEY"
+  db: "tracking.db"                  # shared file with tracking (separate table)
+  tier_mapping_version: "v1"
