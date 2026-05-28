@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from proxy.forwarder import stream_completion
+from proxy.forwarder import call_non_streaming, stream_completion
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -349,3 +349,149 @@ def test_non_numeric_provider_usage_falls_back_to_token_counter():
     assert output_tokens == 6, (
         "Non-numeric provider usage must fall back to token_counter (6), not crash"
     )
+
+
+# ── call_non_streaming ────────────────────────────────────────────────────────
+
+def _make_ns_response(completion_tokens=10, prompt_tokens=5, has_usage=True):
+    """Build a mock LiteLLM non-streaming response."""
+    resp = MagicMock()
+    if has_usage:
+        resp.usage = MagicMock()
+        resp.usage.completion_tokens = completion_tokens
+        resp.usage.prompt_tokens = prompt_tokens
+    else:
+        resp.usage = None
+    resp.model_dump.return_value = {
+        "id": "ns-test",
+        "object": "chat.completion",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+    }
+    return resp
+
+
+def test_call_non_streaming_returns_response_dict_and_tokens():
+    """Happy path: returns correct (response_dict, output_tokens, cost_usd) tuple."""
+    resp = _make_ns_response(completion_tokens=7, prompt_tokens=3)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=resp)),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await call_non_streaming(_MODEL, _MESSAGES, {})
+
+    response_dict, output_tokens, cost_usd = asyncio.run(_run())
+    assert output_tokens == 7
+    assert cost_usd == 0.0  # no rates configured → zero cost
+    assert response_dict["id"] == "ns-test"
+    assert response_dict["object"] == "chat.completion"
+
+
+def test_call_non_streaming_cost_calculation_with_rates():
+    """cost_usd = (prompt_tokens * input_rate) + (completion_tokens * output_rate)."""
+    resp = _make_ns_response(completion_tokens=20, prompt_tokens=10)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=resp)),
+            patch("litellm.get_model_info", return_value={
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+            }),
+        ):
+            return await call_non_streaming(_MODEL, _MESSAGES, {})
+
+    _, output_tokens, cost_usd = asyncio.run(_run())
+    assert output_tokens == 20
+    # (10 * 0.001) + (20 * 0.002) = 0.010 + 0.040 = 0.050
+    assert abs(cost_usd - 0.050) < 1e-9
+
+
+def test_call_non_streaming_no_usage_returns_zero_tokens_and_cost():
+    """When response.usage is None, output_tokens=0 and cost_usd=0.0."""
+    resp = _make_ns_response(has_usage=False)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=resp)),
+            patch("litellm.get_model_info", return_value={
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+            }),
+        ):
+            return await call_non_streaming(_MODEL, _MESSAGES, {})
+
+    _, output_tokens, cost_usd = asyncio.run(_run())
+    assert output_tokens == 0
+    assert cost_usd == 0.0
+
+
+def test_call_non_streaming_passthrough_fields_forwarded():
+    """temperature, max_tokens etc. must appear in kwargs; unknown fields must not."""
+    resp = _make_ns_response()
+    captured: dict = {}
+
+    async def _fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return resp
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=_fake_acompletion),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await call_non_streaming(
+                _MODEL,
+                _MESSAGES,
+                {"temperature": 0.7, "max_tokens": 256, "unknown_field": "ignored"},
+            )
+
+    asyncio.run(_run())
+    assert captured["model"] == _MODEL
+    assert captured["messages"] == _MESSAGES
+    assert captured["temperature"] == 0.7
+    assert captured["max_tokens"] == 256
+    assert "unknown_field" not in captured
+    assert "stream" not in captured  # non-streaming path must NOT set stream=True
+
+
+def test_call_non_streaming_exception_propagates():
+    """If litellm.acompletion raises, the exception must propagate unchanged."""
+    async def _run():
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=RuntimeError("provider down"))):
+            await call_non_streaming(_MODEL, _MESSAGES, {})
+
+    with pytest.raises(RuntimeError, match="provider down"):
+        asyncio.run(_run())
+
+
+def test_call_non_streaming_dict_fallback_when_no_model_dump():
+    """When response lacks model_dump, dict(response) is used as response_dict."""
+
+    class _LegacyResponse:
+        """Mapping-protocol object — dict() works, model_dump attribute absent."""
+        def __init__(self):
+            self.usage = None
+            self._data = {"id": "legacy-resp", "object": "chat.completion"}
+
+        def keys(self):
+            return self._data.keys()
+
+        def __getitem__(self, key):
+            return self._data[key]
+
+    resp = _LegacyResponse()
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=resp)),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await call_non_streaming(_MODEL, _MESSAGES, {})
+
+    response_dict, output_tokens, cost_usd = asyncio.run(_run())
+    assert response_dict["id"] == "legacy-resp"
+    assert output_tokens == 0
+    assert cost_usd == 0.0
