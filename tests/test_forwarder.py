@@ -495,3 +495,144 @@ def test_call_non_streaming_dict_fallback_when_no_model_dump():
     assert response_dict["id"] == "legacy-resp"
     assert output_tokens == 0
     assert cost_usd == 0.0
+
+
+# ── _get_cost_rates exception path (forwarder.py L44-45) ─────────────────────
+
+def test_get_model_info_exception_falls_back_to_zero_cost():
+    """L44-45: when get_model_info raises, _get_cost_rates returns (0, 0) — no crash."""
+    resp = _make_ns_response(completion_tokens=5, prompt_tokens=3)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=resp)),
+            patch("litellm.get_model_info", side_effect=RuntimeError("model unknown")),
+        ):
+            return await call_non_streaming(_MODEL, _MESSAGES, {})
+
+    _, output_tokens, cost_usd = asyncio.run(_run())
+    assert output_tokens == 5
+    assert cost_usd == 0.0  # rates fell back to (0, 0) — no crash
+
+
+# ── _compute_streaming_cost token_counter exception paths ────────────────────
+# Each test makes token_counter raise for the relevant fallback branch, and
+# verifies the exception is silently swallowed (output stays 0).
+
+def test_token_counter_exception_in_no_usage_path_swallowed():
+    """L97-98, L101-102: when provider sends no usage and token_counter raises,
+    both output and input fallbacks are silently swallowed — output_tokens stays 0."""
+    chunks = [_make_chunk(content="Hello")]  # no usage chunk → no provider_usage
+    acomp = _AsyncIter(chunks)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", side_effect=RuntimeError("tokenizer down")),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await _collect(_MODEL, _MESSAGES, {})
+
+    # Must NOT raise — both except clauses absorb the errors
+    results = asyncio.run(_run())
+    assert results[-1][0] == "data: [DONE]\n\n"
+    _, output_tokens, cost_usd = results[-1]
+    assert output_tokens == 0
+    assert cost_usd == 0.0
+
+
+def test_token_counter_exception_when_completion_tokens_absent():
+    """L85-86: provider_usage present but completion_tokens missing;
+    token_counter fallback raises → output_tokens stays 0, no crash."""
+    chunks = [
+        _make_chunk(usage={"prompt_tokens": 10}),  # completion_tokens absent → ct=None
+    ]
+    acomp = _AsyncIter(chunks)
+
+    call_no = [0]
+
+    def _raise_for_output(*args, **kwargs):
+        call_no[0] += 1
+        if "text" in kwargs:  # output-side call uses text=
+            raise RuntimeError("tokenizer down")
+        return 5  # input-side call succeeds
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", side_effect=_raise_for_output),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await _collect(_MODEL, _MESSAGES, {})
+
+    results = asyncio.run(_run())
+    _, output_tokens, _ = results[-1]
+    assert output_tokens == 0  # exception swallowed; stays at default
+
+
+def test_token_counter_exception_when_prompt_tokens_absent():
+    """L92-93: provider_usage present but prompt_tokens missing;
+    token_counter fallback raises → cost stays at output-only, no crash."""
+    chunks = [
+        _make_chunk(usage={"completion_tokens": 20}),  # prompt_tokens absent → pt=None
+    ]
+    acomp = _AsyncIter(chunks)
+
+    def _raise_for_input(*args, **kwargs):
+        if "messages" in kwargs:  # input-side call uses messages=
+            raise RuntimeError("tokenizer down")
+        return 0  # output-side never called (ct=20 used directly)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", side_effect=_raise_for_input),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await _collect(_MODEL, _MESSAGES, {})
+
+    results = asyncio.run(_run())
+    _, output_tokens, _ = results[-1]
+    assert output_tokens == 20  # from provider; input-side exception silently swallowed
+
+
+# ── aclose() exception path (forwarder.py L194-198) ──────────────────────────
+
+class _AsyncIterWithBadClose:
+    """Yields from a list normally, but aclose() raises."""
+
+    def __init__(self, items: list):
+        self._items = iter(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._items)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def aclose(self):
+        raise RuntimeError("transport close failed")
+
+
+def test_aclose_exception_is_suppressed():
+    """L194-198: when aclose() raises, the exception must be swallowed —
+    stream_completion must still yield [DONE] and not re-raise the cleanup error."""
+    chunks = [_make_chunk(content="Hello")]
+    acomp = _AsyncIterWithBadClose(chunks)
+
+    async def _run():
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=acomp)),
+            patch("litellm.token_counter", return_value=2),
+            patch("litellm.get_model_info", return_value={}),
+        ):
+            return await _collect(_MODEL, _MESSAGES, {})
+
+    # Must complete without raising despite aclose() failing
+    results = asyncio.run(_run())
+    assert results[-1][0] == "data: [DONE]\n\n"
+    _, output_tokens, _ = results[-1]
+    assert output_tokens == 2
