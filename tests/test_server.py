@@ -5,12 +5,12 @@ Uses FastAPI TestClient + mock patches on the forwarder functions.
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-from proxy.config import ModelConfig, ProxyConfig, ServerConfig, TrackingConfig
+from proxy.config import ModelConfig, ProxyConfig, RoutingConfig, ServerConfig, TrackingConfig
 from proxy.server import create_app
 from proxy.tracker import RequestTracker
 
@@ -351,3 +351,146 @@ def test_usage_recent_endpoint(client, tracker):
     assert resp.status_code == 200
     data = resp.json()
     assert len(data) == 3
+
+
+# ── adaptive routing integration ───────────────────────────────────────────────
+
+_ROUTING_ALIASES = {
+    "cheap":  "openrouter/test/cheap-model",
+    "medium": "openrouter/test/medium-model",
+    "strong": "openrouter/test/strong-model",
+    "auto":   "openrouter/test/cheap-model",   # fallback placeholder
+}
+
+
+@pytest.fixture
+def routing_client(tmp_path):
+    """TestClient with adaptive routing enabled (categorizer mocked in each test)."""
+    cfg = ProxyConfig(
+        server=ServerConfig(host="127.0.0.1", port=8888),
+        models=ModelConfig(aliases=_ROUTING_ALIASES, default="cheap"),
+        tracking=TrackingConfig(db=":memory:", enabled=True),
+        routing=RoutingConfig(
+            enabled=True,
+            db=str(tmp_path / "routing.db"),
+            categorizer_model="groq/llama-3.1-8b-instant",
+        ),
+    )
+    app = create_app(cfg, None)
+    return TestClient(app)
+
+
+def _cat_mock(category: str, confidence: float = 0.95) -> MagicMock:
+    """Build a mock litellm response shaped like a categorizer reply."""
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].message.content = json.dumps(
+        {"category": category, "confidence": confidence}
+    )
+    return resp
+
+
+def test_auto_model_routes_coding_to_strong(routing_client):
+    """model='auto', 'coding' category → strong model forwarded to forwarder."""
+    with (
+        patch("proxy.server.call_non_streaming", return_value=(_MOCK_RESPONSE, 5, 0.0)) as mock_fwd,
+        patch("proxy.router.litellm.acompletion", new_callable=AsyncMock,
+              return_value=_cat_mock("coding", 0.97)),
+        patch("litellm.token_counter", return_value=5),
+    ):
+        resp = routing_client.post(
+            "/v1/chat/completions",
+            json={"model": "auto", "messages": [{"role": "user", "content": "fix my code"}]},
+        )
+    assert resp.status_code == 200
+    assert mock_fwd.call_args[0][0] == "openrouter/test/strong-model"
+
+
+def test_auto_model_routes_casual_to_cheap(routing_client):
+    """model='auto', 'casual' category → cheap model forwarded."""
+    with (
+        patch("proxy.server.call_non_streaming", return_value=(_MOCK_RESPONSE, 5, 0.0)) as mock_fwd,
+        patch("proxy.router.litellm.acompletion", new_callable=AsyncMock,
+              return_value=_cat_mock("casual", 0.98)),
+        patch("litellm.token_counter", return_value=5),
+    ):
+        resp = routing_client.post(
+            "/v1/chat/completions",
+            json={"model": "auto", "messages": [{"role": "user", "content": "good morning!"}]},
+        )
+    assert resp.status_code == 200
+    assert mock_fwd.call_args[0][0] == "openrouter/test/cheap-model"
+
+
+def test_non_auto_model_with_routing_enabled_skips_router(routing_client):
+    """model='cheap' with routing enabled: categorizer NOT called, alias used."""
+    with (
+        patch("proxy.server.call_non_streaming", return_value=(_MOCK_RESPONSE, 5, 0.0)) as mock_fwd,
+        patch("proxy.router.litellm.acompletion", new_callable=AsyncMock) as mock_cat,
+        patch("litellm.token_counter", return_value=5),
+    ):
+        resp = routing_client.post(
+            "/v1/chat/completions",
+            json={"model": "cheap", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 200
+    mock_cat.assert_not_called()
+    assert mock_fwd.call_args[0][0] == "openrouter/test/cheap-model"
+
+
+def test_routing_disabled_auto_model_uses_alias(client):
+    """Routing disabled: model='auto' falls through to alias resolution.
+    The base config has no 'auto' alias → 'auto' is forwarded unchanged."""
+    with (
+        patch("proxy.server.call_non_streaming", return_value=(_MOCK_RESPONSE, 5, 0.0)) as mock_fwd,
+        patch("proxy.router.litellm.acompletion", new_callable=AsyncMock) as mock_cat,
+        patch("litellm.token_counter", return_value=5),
+    ):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 200
+    mock_cat.assert_not_called()
+    assert mock_fwd.call_args[0][0] == "auto"   # no alias → passed through unchanged
+
+
+def test_auto_model_no_user_messages_routes_as_casual(routing_client):
+    """No user-role messages: last_user_msg='' → LLMCategorizer short-circuits
+    to 'casual' without an LLM call → cheap model forwarded."""
+    with (
+        patch("proxy.server.call_non_streaming", return_value=(_MOCK_RESPONSE, 5, 0.0)) as mock_fwd,
+        patch("proxy.router.litellm.acompletion", new_callable=AsyncMock) as mock_cat,
+        patch("litellm.token_counter", return_value=0),
+    ):
+        resp = routing_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [{"role": "system", "content": "you are helpful"}],
+            },
+        )
+    assert resp.status_code == 200
+    mock_cat.assert_not_called()   # empty text → casual without LLM call
+    assert mock_fwd.call_args[0][0] == "openrouter/test/cheap-model"
+
+
+def test_auto_model_routing_streaming_uses_correct_model(routing_client):
+    """model='auto' + stream=True: routing resolves model before streaming."""
+    with (
+        patch("proxy.server.stream_completion", return_value=_mock_stream_gen()) as mock_stream,
+        patch("proxy.router.litellm.acompletion", new_callable=AsyncMock,
+              return_value=_cat_mock("reasoning", 0.88)),
+        patch("litellm.token_counter", return_value=5),
+    ):
+        resp = routing_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [{"role": "user", "content": "should I use microservices?"}],
+                "stream": True,
+            },
+        )
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    assert mock_stream.call_args[0][0] == "openrouter/test/strong-model"  # reasoning → strong

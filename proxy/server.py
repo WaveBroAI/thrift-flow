@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy.config import ProxyConfig
 from proxy.forwarder import call_non_streaming, stream_completion
+from proxy.router import ModelRouter
 from proxy.tracker import RequestTracker
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,16 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
     """Create and configure the FastAPI application."""
 
     app = FastAPI(title="thrift-flow", version=_VERSION)
+
+    # ── Adaptive model router (Phase 2) ───────────────────────────────────────
+    # Created once per app instance; holds the per-session context cache.
+    # Only active when config.routing.enabled=True.
+    _model_router: ModelRouter | None = None
+    if config.routing.enabled:
+        _model_router = ModelRouter(
+            aliases=config.models.aliases,
+            routing_config=config.routing,
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -51,8 +62,26 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
             raise HTTPException(status_code=400, detail="Invalid JSON body")
 
         model_requested: str = body.get("model", config.models.default)
-        model_resolved: str = config.resolve_model(model_requested)
         messages: list[dict] = body.get("messages", [])
+
+        # ── model resolution ──────────────────────────────────────────────────
+        # model="auto" + routing enabled → adaptive router picks tier + model.
+        # Any other model name → alias resolution (or pass-through if unknown).
+        if model_requested == "auto" and _model_router is not None:
+            _last_user_msg = next(
+                (m.get("content", "") for m in reversed(messages)
+                 if m.get("role") == "user"),
+                "",
+            )
+            _, model_resolved = await _model_router.route(
+                _last_user_msg,
+                messages,
+                prompt_for_hash=_last_user_msg,
+                session_key=session_key,
+            )
+        else:
+            model_resolved = config.resolve_model(model_requested)
+
         _stream = body.get("stream")
         is_streaming: bool = _stream is True or _stream == 1  # Fix C: accept numeric 1
 
