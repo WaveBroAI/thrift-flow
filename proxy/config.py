@@ -32,7 +32,7 @@ class RoutingConfig:
 
     Requires GROQ_API_KEY (or another provider key) if categorizer_model
     points to a provider-specific model (e.g. groq/llama-3.1-8b-instant).
-    Has no effect until model: "auto" wiring is added in server.py (PR B).
+    Has no effect until model: "auto" wiring is added in server.py (PR B2).
     """
 
     enabled: bool = False
@@ -41,6 +41,10 @@ class RoutingConfig:
     categorizer_api_key_env: str | None = None    # env var holding the API key
     db: str = "tracking.db"                       # shared with TrackingConfig (separate table)
     tier_mapping_version: str = "v1"
+    confidence_threshold: float = 0.7             # min confidence for pool eligibility
+    min_prompt_length_for_pool: int = 10          # min prompt chars for pool eligibility
+    session_ttl_seconds: int = 1800               # session context cache TTL (seconds)
+    categorizer_timeout: float = 5.0              # LLM categorizer timeout (seconds)
 
 
 @dataclass
@@ -81,6 +85,10 @@ class ProxyConfig:
             categorizer_api_key_env=routing_raw.get("categorizer_api_key_env") or None,
             db=routing_raw.get("db", tracking_raw.get("db", "tracking.db")),
             tier_mapping_version=routing_raw.get("tier_mapping_version", "v1"),
+            confidence_threshold=routing_raw.get("confidence_threshold", 0.7),
+            min_prompt_length_for_pool=routing_raw.get("min_prompt_length_for_pool", 10),
+            session_ttl_seconds=routing_raw.get("session_ttl_seconds", 1800),
+            categorizer_timeout=routing_raw.get("categorizer_timeout", 5.0),
         )
 
         return cls(server=server, models=models, tracking=tracking, routing=routing)

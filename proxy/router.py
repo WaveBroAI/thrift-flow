@@ -13,8 +13,10 @@ Phase 2 (EmbeddingRouter + ModelRouter) is implemented in a later PR.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -236,7 +238,7 @@ CREATE TABLE IF NOT EXISTS routing_log (
 """
 
 # Valid source values — enforced at write time (warn, not reject)
-VALID_SOURCES = frozenset({"llm_categorizer", "default"})
+VALID_SOURCES = frozenset({"llm_categorizer", "default", "continuation"})
 
 
 class RoutingLogger:
@@ -337,3 +339,183 @@ class RoutingLogger:
             )
         except Exception as exc:
             logger.error(f"[RoutingLogger] Failed to write routing_log: {exc}")
+
+
+# ── ModelRouter ───────────────────────────────────────────────────────────────
+
+class ModelRouter:
+    """Adaptive model router — Phase 2.
+
+    Wraps LLMCategorizer + RoutingLogger and adds session-level caching to skip
+    re-categorization during tool-loop continuations (when the last message role
+    is ``tool`` or ``assistant`` and the session cache is still fresh).
+
+    Usage:
+        router = ModelRouter(aliases=config.models.aliases,
+                             routing_config=config.routing)
+        tier, model = await router.route(text, messages, session_key="abc")
+
+    Returns:
+        (tier, model): tier ∈ {cheap, medium, strong},
+                       model is the LiteLLM model string for that tier.
+
+    Never raises — degrades to (medium, medium_model) on any unhandled error.
+    """
+
+    _ROUTER_VERSION = "phase2_llm"
+
+    def __init__(
+        self,
+        aliases: dict[str, str],
+        routing_config: Any,          # RoutingConfig — avoid circular import at module level
+    ) -> None:
+        self._aliases = aliases
+        self._cfg = routing_config
+        self._conv_context: dict[str, dict] = {}
+
+        # Resolve API key from environment
+        api_key: str | None = None
+        if routing_config.categorizer_api_key_env:
+            api_key = os.environ.get(routing_config.categorizer_api_key_env)
+            if not api_key:
+                logger.warning(
+                    f"[ModelRouter] Env var '{routing_config.categorizer_api_key_env}' "
+                    "is not set — categorizer calls may fail"
+                )
+
+        # Categorizer model falls back to cheap alias when not explicitly set
+        cat_model = routing_config.categorizer_model or aliases.get("cheap", "")
+
+        self._categorizer = LLMCategorizer(
+            model=cat_model,
+            api_base=routing_config.categorizer_api_base,
+            api_key=api_key,
+            timeout=routing_config.categorizer_timeout,
+        )
+        self._routing_logger = RoutingLogger(routing_config.db)
+
+    async def route(
+        self,
+        text: str,
+        messages: list[dict],
+        prompt_for_hash: str | None = None,
+        session_key: str | None = None,
+    ) -> tuple[str, str]:
+        """Classify text and return (tier, model_name).
+
+        Skips the categorizer and returns the cached (tier, model) when the last
+        message is a tool-loop continuation within the session TTL.
+
+        Args:
+            text:            Last user message to classify.
+            messages:        Full conversation message list (roles checked for
+                             tool-loop detection).
+            prompt_for_hash: Raw prompt stored in routing_log (may differ from
+                             text when caller passes the full conversation).
+            session_key:     Opaque key identifying the conversation session.
+                             No caching when None.
+
+        Returns:
+            (tier, model): e.g. ("strong", "anthropic/claude-sonnet-4-5")
+        """
+        # ── tool-loop continuation: skip categorizer, reuse cached tier ────────
+        if session_key and self._is_continuation(messages, session_key):
+            cached = self._conv_context[session_key]
+            tier = cached["tier"]
+            model = cached["model"]
+            await asyncio.to_thread(
+                self._routing_logger.log,
+                category=cached["category"],
+                selected_tier=tier,
+                tier_mapping_version=self._cfg.tier_mapping_version,
+                model_used=model,
+                router_version=self._ROUTER_VERSION,
+                source="continuation",
+                prompt=prompt_for_hash,
+            )
+            return tier, model
+
+        # ── normal path: call categorizer ─────────────────────────────────────
+        context = self._build_context(session_key, text) if session_key else None
+
+        category, confidence, latency_ms = await self._categorizer.categorize(
+            text, context=context
+        )
+
+        tier = CATEGORY_TIER_MAP.get(category, "medium")
+        model = self._aliases.get(tier, self._aliases.get("cheap", ""))
+
+        pool_eligible = self._is_pool_eligible(category, confidence, text)
+
+        if session_key:
+            self._update_context(session_key, category, tier, model, text)
+
+        await asyncio.to_thread(
+            self._routing_logger.log,
+            category=category,
+            selected_tier=tier,
+            tier_mapping_version=self._cfg.tier_mapping_version,
+            model_used=model,
+            router_version=self._ROUTER_VERSION,
+            source="llm_categorizer",
+            category_confidence=confidence,
+            pool_eligible=pool_eligible,
+            prompt=prompt_for_hash,
+            latency_ms=latency_ms,
+        )
+
+        return tier, model
+
+    # ── private helpers ───────────────────────────────────────────────────────
+
+    def _is_continuation(self, messages: list[dict], session_key: str) -> bool:
+        """True if last message is a tool/assistant turn and cache is still fresh."""
+        if not messages:
+            return False
+        last_role = messages[-1].get("role", "")
+        if last_role not in ("tool", "assistant"):
+            return False
+        cached = self._conv_context.get(session_key)
+        if not cached:
+            return False
+        return (time.time() - cached["timestamp"]) <= self._cfg.session_ttl_seconds
+
+    def _build_context(self, session_key: str, current_text: str) -> str | None:
+        """Return prior-context hint string, or None if cache missing / expired."""
+        cached = self._conv_context.get(session_key)
+        if not cached:
+            return None
+        age = time.time() - cached["timestamp"]
+        if age > self._cfg.session_ttl_seconds:
+            del self._conv_context[session_key]
+            return None
+        return (
+            f"[Previous routing: {cached['category']}, {int(age)}s ago]\n"
+            f"[Previous message:] {cached['last_user_msg'][:200]}"
+        )
+
+    def _update_context(
+        self,
+        session_key: str,
+        category: str,
+        tier: str,
+        model: str,
+        text: str,
+    ) -> None:
+        self._conv_context[session_key] = {
+            "category": category,
+            "tier":     tier,
+            "model":    model,
+            "last_user_msg": text,
+            "timestamp": time.time(),
+        }
+
+    def _is_pool_eligible(
+        self, category: str, confidence: float, text: str
+    ) -> bool:
+        """Quality gate: True when this prompt is worth adding to the embedding pool."""
+        return (
+            category != "unknown"
+            and confidence >= self._cfg.confidence_threshold
+            and len(text) >= self._cfg.min_prompt_length_for_pool
+        )

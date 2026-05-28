@@ -54,3 +54,7 @@ routing:
   categorizer_api_key_env: null      # e.g. "GROQ_API_KEY"
   db: "tracking.db"                  # shared file with tracking (separate table)
   tier_mapping_version: "v1"
+  confidence_threshold: 0.7          # min confidence for embedding pool eligibility
+  min_prompt_length_for_pool: 10     # min prompt chars for pool eligibility
+  session_ttl_seconds: 1800          # session context cache TTL (30 min)
+  categorizer_timeout: 5.0           # categorizer LLM call timeout (seconds)

@@ -1,5 +1,5 @@
 """
-Unit tests for proxy/router.py — LLMCategorizer and RoutingLogger.
+Unit tests for proxy/router.py — LLMCategorizer, RoutingLogger, ModelRouter.
 
 No real LLM calls or API keys needed: litellm.acompletion is mocked throughout.
 """
@@ -8,15 +8,18 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from proxy.config import RoutingConfig
 from proxy.router import (
     CATEGORY_TIER_MAP,
     VALID_CATEGORIES,
     VALID_SOURCES,
     LLMCategorizer,
+    ModelRouter,
     RoutingLogger,
 )
 
@@ -52,6 +55,7 @@ def test_tier_values_are_cheap_medium_strong():
 def test_valid_sources_contains_expected_values():
     assert "llm_categorizer" in VALID_SOURCES
     assert "default" in VALID_SOURCES
+    assert "continuation" in VALID_SOURCES
 
 
 # ── LLMCategorizer.categorize — empty / whitespace ────────────────────────────
@@ -494,3 +498,365 @@ def test_routing_logger_multiple_rows(tmp_path):
     with sqlite3.connect(db) as conn:
         count = conn.execute("SELECT COUNT(*) FROM routing_log").fetchone()[0]
     assert count == 3
+
+
+# ── ModelRouter helpers ───────────────────────────────────────────────────────
+
+_DEFAULT_ALIASES = {
+    "cheap":  "groq/llama-3.1-8b-instant",
+    "medium": "openrouter/qwen/qwen3-235b-a22b",
+    "strong": "anthropic/claude-sonnet-4-5",
+}
+
+
+def _make_routing_cfg(tmp_path, **overrides) -> RoutingConfig:
+    defaults: dict = dict(
+        db=str(tmp_path / "routing.db"),
+        confidence_threshold=0.7,
+        min_prompt_length_for_pool=10,
+        session_ttl_seconds=1800,
+        categorizer_timeout=5.0,
+    )
+    defaults.update(overrides)
+    return RoutingConfig(**defaults)
+
+
+def _make_router(tmp_path, aliases=None, **cfg_overrides) -> tuple[ModelRouter, str]:
+    cfg = _make_routing_cfg(tmp_path, **cfg_overrides)
+    router = ModelRouter(aliases=aliases or _DEFAULT_ALIASES, routing_config=cfg)
+    return router, cfg.db
+
+
+def _cat_response(category: str, confidence: float = 0.9) -> MagicMock:
+    return _mock_response(json.dumps({"category": category, "confidence": confidence}))
+
+
+# ── ModelRouter — construction ────────────────────────────────────────────────
+
+def test_model_router_constructs_without_api_key_env(tmp_path):
+    """Constructing with no categorizer_api_key_env must not raise."""
+    router, _ = _make_router(tmp_path)
+    assert router is not None
+
+
+def test_model_router_api_key_from_env(tmp_path, monkeypatch):
+    """When env var is set, the categorizer receives the resolved key."""
+    monkeypatch.setenv("TEST_ROUTER_API_KEY", "sk-test-key-abc")
+    router, _ = _make_router(tmp_path, categorizer_api_key_env="TEST_ROUTER_API_KEY")
+    assert router._categorizer._api_key == "sk-test-key-abc"
+
+
+def test_model_router_missing_api_key_env_warns(tmp_path, caplog):
+    """When env var is declared but not set, a WARNING is logged."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="proxy.router"):
+        _make_router(tmp_path, categorizer_api_key_env="NONEXISTENT_ROUTER_KEY_XYZ")
+    assert "NONEXISTENT_ROUTER_KEY_XYZ" in caplog.text
+
+
+def test_model_router_categorizer_falls_back_to_cheap_alias(tmp_path):
+    """When categorizer_model is None, the cheap alias is used."""
+    router, _ = _make_router(tmp_path)  # categorizer_model=None by default
+    assert router._categorizer._model == _DEFAULT_ALIASES["cheap"]
+
+
+# ── ModelRouter — happy paths ─────────────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_model_router_coding_returns_strong(tmp_path):
+    router, _ = _make_router(tmp_path)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("coding", 0.97),
+    ):
+        tier, model = await router.route(
+            "fix this bug please",
+            [{"role": "user", "content": "fix this bug please"}],
+        )
+    assert tier == "strong"
+    assert model == _DEFAULT_ALIASES["strong"]
+
+
+@pytest.mark.anyio
+async def test_model_router_casual_returns_cheap(tmp_path):
+    router, _ = _make_router(tmp_path)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("casual", 0.95),
+    ):
+        tier, model = await router.route(
+            "good morning!",
+            [{"role": "user", "content": "good morning!"}],
+        )
+    assert tier == "cheap"
+    assert model == _DEFAULT_ALIASES["cheap"]
+
+
+@pytest.mark.anyio
+async def test_model_router_unknown_category_returns_medium(tmp_path):
+    router, _ = _make_router(tmp_path)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("unknown", 0.4),
+    ):
+        tier, model = await router.route(
+            "xyzzy plugh",
+            [{"role": "user", "content": "xyzzy plugh"}],
+        )
+    assert tier == "medium"
+    assert model == _DEFAULT_ALIASES["medium"]
+
+
+# ── ModelRouter — session caching / continuation ──────────────────────────────
+
+@pytest.mark.anyio
+async def test_model_router_no_session_key_no_cache_stored(tmp_path):
+    """session_key=None — categorizer is called and nothing is cached."""
+    router, _ = _make_router(tmp_path)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("casual", 0.9),
+    ) as mock_ac:
+        await router.route("hi", [{"role": "user", "content": "hi"}])
+    mock_ac.assert_called_once()
+    assert not router._conv_context
+
+
+@pytest.mark.anyio
+async def test_model_router_cache_hit_last_role_user_calls_categorizer(tmp_path):
+    """Cache hit + last role='user' → NOT a continuation → categorizer called."""
+    router, _ = _make_router(tmp_path)
+    router._conv_context["s1"] = {
+        "category": "coding", "tier": "strong",
+        "model": _DEFAULT_ALIASES["strong"],
+        "last_user_msg": "first question",
+        "timestamp": time.time(),
+    }
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("coding", 0.91),
+    ) as mock_ac:
+        await router.route(
+            "follow-up",
+            [{"role": "user", "content": "follow-up"}],
+            session_key="s1",
+        )
+    mock_ac.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_model_router_cache_hit_last_role_tool_is_continuation(tmp_path):
+    """Cache hit + last role='tool' → continuation → categorizer skipped."""
+    router, _ = _make_router(tmp_path)
+    router._conv_context["s2"] = {
+        "category": "coding", "tier": "strong",
+        "model": _DEFAULT_ALIASES["strong"],
+        "last_user_msg": "run my code",
+        "timestamp": time.time(),
+    }
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+    ) as mock_ac:
+        tier, model = await router.route(
+            "tool_result",
+            [{"role": "tool", "content": "tool output"}],
+            session_key="s2",
+        )
+    mock_ac.assert_not_called()
+    assert tier == "strong"
+    assert model == _DEFAULT_ALIASES["strong"]
+
+
+@pytest.mark.anyio
+async def test_model_router_cache_hit_last_role_assistant_is_continuation(tmp_path):
+    """Cache hit + last role='assistant' → continuation → categorizer skipped."""
+    router, _ = _make_router(tmp_path)
+    router._conv_context["s3"] = {
+        "category": "reasoning", "tier": "strong",
+        "model": _DEFAULT_ALIASES["strong"],
+        "last_user_msg": "what's the plan?",
+        "timestamp": time.time(),
+    }
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+    ) as mock_ac:
+        tier, model = await router.route(
+            "",
+            [{"role": "assistant", "content": "here is the plan..."}],
+            session_key="s3",
+        )
+    mock_ac.assert_not_called()
+    assert tier == "strong"
+
+
+@pytest.mark.anyio
+async def test_model_router_no_cache_last_role_tool_calls_categorizer(tmp_path):
+    """No cache + last role='tool' → _is_continuation returns False → categorizer called."""
+    router, _ = _make_router(tmp_path)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("coding", 0.9),
+    ) as mock_ac:
+        await router.route(
+            "tool result text",
+            [{"role": "tool", "content": "result"}],
+            session_key="s-fresh",
+        )
+    mock_ac.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_model_router_cache_expired_calls_categorizer(tmp_path):
+    """Expired cache + last role='tool' → not a continuation → categorizer called."""
+    router, _ = _make_router(tmp_path, session_ttl_seconds=1)
+    router._conv_context["s4"] = {
+        "category": "coding", "tier": "strong",
+        "model": _DEFAULT_ALIASES["strong"],
+        "last_user_msg": "old message",
+        "timestamp": time.time() - 9999,     # far in the past
+    }
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("analysis", 0.85),
+    ) as mock_ac:
+        tier, model = await router.route(
+            "new message here",
+            [{"role": "tool", "content": "tool result"}],
+            session_key="s4",
+        )
+    mock_ac.assert_called_once()
+    assert tier == "medium"   # "analysis" maps to medium
+
+
+@pytest.mark.anyio
+async def test_model_router_empty_messages_calls_categorizer(tmp_path):
+    """Empty message list → _is_continuation returns False → categorizer called."""
+    router, _ = _make_router(tmp_path)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("casual", 0.9),
+    ) as mock_ac:
+        await router.route("hi", [], session_key="s5")
+    mock_ac.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_model_router_session_context_updated_after_route(tmp_path):
+    """After a normal route(), session cache is populated with new category/tier."""
+    router, _ = _make_router(tmp_path)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("creative", 0.88),
+    ):
+        await router.route(
+            "write me a poem",
+            [{"role": "user", "content": "write me a poem"}],
+            session_key="s6",
+        )
+    assert "s6" in router._conv_context
+    assert router._conv_context["s6"]["category"] == "creative"
+    assert router._conv_context["s6"]["tier"] == "medium"
+
+
+@pytest.mark.anyio
+async def test_model_router_build_context_returns_none_no_cache(tmp_path):
+    """_build_context returns None when session has no prior cache entry."""
+    router, _ = _make_router(tmp_path)
+    result = router._build_context("no-such-session", "some text")
+    assert result is None
+
+
+@pytest.mark.anyio
+async def test_model_router_build_context_deletes_expired_entry(tmp_path):
+    """_build_context removes the expired entry and returns None."""
+    router, _ = _make_router(tmp_path, session_ttl_seconds=1)
+    router._conv_context["s7"] = {
+        "category": "coding", "tier": "strong",
+        "model": _DEFAULT_ALIASES["strong"],
+        "last_user_msg": "old",
+        "timestamp": time.time() - 9999,
+    }
+    result = router._build_context("s7", "new")
+    assert result is None
+    assert "s7" not in router._conv_context
+
+
+# ── ModelRouter — routing_log entries ────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_model_router_logs_llm_categorizer_source(tmp_path):
+    router, db = _make_router(tmp_path)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("coding", 0.97),
+    ):
+        await router.route(
+            "fix this bug",
+            [{"role": "user", "content": "fix this bug"}],
+            prompt_for_hash="fix this bug",
+            session_key="s8",
+        )
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM routing_log").fetchone()
+    assert row["source"] == "llm_categorizer"
+    assert row["category"] == "coding"
+    assert row["selected_tier"] == "strong"
+    assert row["router_version"] == "phase2_llm"
+
+
+@pytest.mark.anyio
+async def test_model_router_logs_continuation_source(tmp_path):
+    router, db = _make_router(tmp_path)
+    router._conv_context["s9"] = {
+        "category": "coding", "tier": "strong",
+        "model": _DEFAULT_ALIASES["strong"],
+        "last_user_msg": "fix code",
+        "timestamp": time.time(),
+    }
+    with patch("proxy.router.litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+        await router.route(
+            "",
+            [{"role": "tool", "content": "output"}],
+            session_key="s9",
+        )
+    mock_ac.assert_not_called()
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT source, category FROM routing_log").fetchone()
+    assert row["source"] == "continuation"
+    assert row["category"] == "coding"
+
+
+# ── ModelRouter — _is_pool_eligible ──────────────────────────────────────────
+
+def test_pool_eligible_all_conditions_met(tmp_path):
+    router, _ = _make_router(tmp_path, confidence_threshold=0.7, min_prompt_length_for_pool=5)
+    assert router._is_pool_eligible("coding", 0.8, "fix my bug") is True
+
+
+def test_pool_eligible_unknown_category_is_false(tmp_path):
+    router, _ = _make_router(tmp_path)
+    assert router._is_pool_eligible("unknown", 0.9, "some long text here") is False
+
+
+def test_pool_eligible_low_confidence_is_false(tmp_path):
+    router, _ = _make_router(tmp_path, confidence_threshold=0.7)
+    assert router._is_pool_eligible("coding", 0.5, "fix my bug here today") is False
+
+
+def test_pool_eligible_short_text_is_false(tmp_path):
+    router, _ = _make_router(tmp_path, min_prompt_length_for_pool=10)
+    assert router._is_pool_eligible("coding", 0.9, "hi") is False
