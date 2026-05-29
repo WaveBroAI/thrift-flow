@@ -494,3 +494,21 @@ def test_auto_model_routing_streaming_uses_correct_model(routing_client):
     assert resp.status_code == 200
     assert "text/event-stream" in resp.headers["content-type"]
     assert mock_stream.call_args[0][0] == "openrouter/test/strong-model"  # reasoning → strong
+
+
+def test_auto_model_multimodal_content_does_not_crash(routing_client):
+    """Fix #1+#2: multimodal content (list) must not crash via .strip() or .encode()."""
+    multimodal_msg = [{"type": "text", "text": "fix my code"}, {"type": "image_url", "url": "..."}]
+    with (
+        patch("proxy.server.call_non_streaming", return_value=(_MOCK_RESPONSE, 5, 0.0)) as mock_fwd,
+        patch("proxy.router.litellm.acompletion", new_callable=AsyncMock) as mock_cat,
+        patch("litellm.token_counter", return_value=5),
+    ):
+        resp = routing_client.post(
+            "/v1/chat/completions",
+            json={"model": "auto", "messages": [{"role": "user", "content": multimodal_msg}]},
+        )
+    # Must not 500 — content list handled gracefully (categorize returns casual)
+    assert resp.status_code == 200
+    mock_cat.assert_not_called()   # list → non-string → casual short-circuit, no LLM call
+    assert mock_fwd.call_args[0][0] == "openrouter/test/cheap-model"  # casual → cheap

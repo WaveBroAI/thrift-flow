@@ -68,11 +68,13 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
         # model="auto" + routing enabled → adaptive router picks tier + model.
         # Any other model name → alias resolution (or pass-through if unknown).
         if model_requested == "auto" and _model_router is not None:
-            _last_user_msg = next(
-                (m.get("content", "") for m in reversed(messages)
+            # content can be a list for multimodal requests — use str only.
+            _raw_content = next(
+                (m.get("content") for m in reversed(messages)
                  if m.get("role") == "user"),
-                "",
+                None,
             )
+            _last_user_msg = _raw_content if isinstance(_raw_content, str) else ""
             _, model_resolved = await _model_router.route(
                 _last_user_msg,
                 messages,

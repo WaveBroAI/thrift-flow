@@ -58,13 +58,24 @@ def test_valid_sources_contains_expected_values():
     assert "continuation" in VALID_SOURCES
 
 
-# ── LLMCategorizer.categorize — empty / whitespace ────────────────────────────
+# ── LLMCategorizer.categorize — empty / whitespace / non-string ──────────────
 
 @pytest.mark.anyio
 async def test_empty_text_returns_casual_without_llm_call():
     cat = _categorizer()
     with patch("proxy.router.litellm.acompletion", new_callable=AsyncMock) as mock_ac:
         result = await cat.categorize("")
+    assert result == ("casual", 1.0, None)
+    mock_ac.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_multimodal_list_content_returns_casual_without_llm_call():
+    """Fix #1: non-string content (multimodal list) must not crash via .strip()."""
+    cat = _categorizer()
+    multimodal_content = [{"type": "text", "text": "fix my code"}, {"type": "image_url", "url": "..."}]
+    with patch("proxy.router.litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+        result = await cat.categorize(multimodal_content)  # type: ignore[arg-type]
     assert result == ("casual", 1.0, None)
     mock_ac.assert_not_called()
 
@@ -276,9 +287,24 @@ def test_parse_response_handles_prose_around_json():
     assert confidence == pytest.approx(0.92)
 
 
+def test_parse_response_handles_nested_json():
+    """Fix #5: response with nested braces must not return unknown due to regex truncation."""
+    cat = _categorizer()
+    raw = '{"category": "coding", "meta": {"v": 1}, "confidence": 0.97}'
+    category, confidence = cat._parse_response(raw)
+    assert category == "coding"
+    assert confidence == pytest.approx(0.97)
+
+
 def test_parse_response_no_json_object_returns_unknown():
     cat = _categorizer()
     assert cat._parse_response("I cannot categorize this.") == ("unknown", 0.0)
+
+
+def test_parse_response_unbalanced_braces_returns_unknown():
+    """Unmatched opening brace (no closing) must return unknown gracefully."""
+    cat = _categorizer()
+    assert cat._parse_response('Here is my answer: {"category": "coding"') == ("unknown", 0.0)
 
 
 def test_parse_response_malformed_json_returns_unknown():
@@ -498,6 +524,28 @@ def test_routing_logger_multiple_rows(tmp_path):
     with sqlite3.connect(db) as conn:
         count = conn.execute("SELECT COUNT(*) FROM routing_log").fetchone()[0]
     assert count == 3
+
+
+def test_routing_logger_non_string_prompt_does_not_raise(tmp_path):
+    """Fix #2: passing a list as prompt must not crash via list.encode()."""
+    db = str(tmp_path / "test.db")
+    rl = RoutingLogger(db)
+    multimodal = [{"type": "text", "text": "fix my code"}]
+    rl.log(
+        category="coding",
+        selected_tier="strong",
+        tier_mapping_version="v1",
+        model_used="groq/llama-3.1-8b-instant",
+        router_version="phase1_llm",
+        source="llm_categorizer",
+        prompt=multimodal,  # type: ignore[arg-type]
+    )
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute("SELECT prompt, prompt_hash FROM routing_log").fetchall()
+    assert len(rows) == 1
+    # Stored as str() representation, not empty
+    assert rows[0][0] is not None
+    assert rows[0][1] is not None
 
 
 # ── ModelRouter helpers ───────────────────────────────────────────────────────
@@ -860,3 +908,83 @@ def test_pool_eligible_low_confidence_is_false(tmp_path):
 def test_pool_eligible_short_text_is_false(tmp_path):
     router, _ = _make_router(tmp_path, min_prompt_length_for_pool=10)
     assert router._is_pool_eligible("coding", 0.9, "hi") is False
+
+
+def test_pool_eligible_non_string_text_is_false(tmp_path):
+    """Fix #1 secondary: non-string text (multimodal list) must not crash len()."""
+    router, _ = _make_router(tmp_path)
+    multimodal = [{"type": "text", "text": "fix my code"}]
+    assert router._is_pool_eligible("coding", 0.9, multimodal) is False  # type: ignore[arg-type]
+
+
+# ── ModelRouter — _conv_context size cap (Fix #3) ─────────────────────────────
+
+@pytest.mark.anyio
+async def test_conv_context_capped_at_max_size(tmp_path):
+    """Fix #3: _conv_context must not grow beyond _MAX_SESSION_CACHE entries."""
+    router, _ = _make_router(tmp_path)
+    # Temporarily lower the cap for the test
+    original_cap = router._MAX_SESSION_CACHE
+    router.__class__._MAX_SESSION_CACHE = 5
+    try:
+        with patch(
+            "proxy.router.litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=_cat_response("casual", 0.9),
+        ):
+            for i in range(10):
+                await router.route(f"msg {i}", [], session_key=f"session-{i}")
+    finally:
+        router.__class__._MAX_SESSION_CACHE = original_cap
+    assert len(router._conv_context) <= 5
+
+
+def test_conv_context_update_moves_to_end(tmp_path):
+    """Fix #3: re-used session should not be evicted before a fresh one."""
+    from collections import OrderedDict
+    router, _ = _make_router(tmp_path)
+    router.__class__._MAX_SESSION_CACHE = 3
+    try:
+        # Seed 3 sessions
+        for key in ("a", "b", "c"):
+            router._conv_context[key] = {"category": "casual", "tier": "cheap",
+                                          "model": "m", "last_user_msg": "", "timestamp": 0.0}
+        # Update "a" — it should move to end and "b" (oldest) gets evicted on next insert
+        router._update_context("a", "coding", "strong", "m", "new")
+        # Add a new session "d" — cap exceeded, oldest (now "b") evicted
+        router._update_context("d", "casual", "cheap", "m", "hi")
+        assert "b" not in router._conv_context   # b was oldest after a moved to end
+        assert "a" in router._conv_context        # a was re-used, should survive
+        assert "d" in router._conv_context        # newly added
+    finally:
+        router.__class__._MAX_SESSION_CACHE = 1000
+
+
+# ── ModelRouter — missing alias fallback (Fix #4) ─────────────────────────────
+
+@pytest.mark.anyio
+async def test_model_router_missing_tier_alias_uses_fallback(tmp_path):
+    """Fix #4: if tier alias is missing, route() returns any available alias, not ''."""
+    # aliases only defines 'strong' — no 'cheap' or 'medium'
+    aliases_sparse = {"strong": "openrouter/test/strong-model"}
+    router, _ = _make_router(tmp_path, aliases=aliases_sparse)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("casual", 0.9),   # casual → cheap tier (missing)
+    ):
+        tier, model = await router.route(
+            "good morning",
+            [{"role": "user", "content": "good morning"}],
+        )
+    assert model != ""  # must not forward empty string to LiteLLM
+    assert model == "openrouter/test/strong-model"  # only available alias
+
+
+def test_model_router_warns_on_missing_tier_alias(tmp_path, caplog):
+    """Fix #4: constructor logs WARNING when tier aliases are incomplete."""
+    import logging
+    aliases_sparse = {"strong": "openrouter/test/strong-model"}
+    with caplog.at_level(logging.WARNING, logger="proxy.router"):
+        _make_router(tmp_path, aliases=aliases_sparse)
+    assert "No alias defined for tier" in caplog.text

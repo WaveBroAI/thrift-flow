@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from typing import Any
 
 import litellm
@@ -143,8 +144,8 @@ class LLMCategorizer:
             (category, confidence, latency_ms).
             latency_ms is None when no LLM call was made (empty input).
         """
-        if not text or not text.strip():
-            # Empty / whitespace → treat as casual; no LLM call needed.
+        # Guard: non-string input (e.g. multimodal content list) → treat as casual.
+        if not isinstance(text, str) or not text or not text.strip():
             return "casual", 1.0, None
 
         messages: list[dict[str, Any]] = [
@@ -189,17 +190,34 @@ class LLMCategorizer:
         # Strip markdown code fences if model wrapped response in ```json ... ```
         clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
 
-        # Extract first JSON object — handles extra prose around the JSON
-        match = re.search(r"\{[^}]+\}", clean)
-        if not match:
-            logger.warning(f"[Categorizer] No JSON object found in response: {raw[:100]}")
-            return "unknown", 0.0
-
+        # Try direct parse first (well-formed response with no surrounding prose).
+        # Fall back to balanced-brace extractor for responses with extra prose.
+        data: dict | None = None
         try:
-            data = json.loads(match.group())
-        except json.JSONDecodeError as exc:
-            logger.warning(f"[Categorizer] JSON parse error: {exc} | raw={raw[:100]}")
-            return "unknown", 0.0
+            data = json.loads(clean)
+        except json.JSONDecodeError:
+            # Find first balanced JSON object (handles nested braces correctly).
+            start = clean.find("{")
+            if start == -1:
+                logger.warning(f"[Categorizer] No JSON object found in response: {raw[:100]}")
+                return "unknown", 0.0
+            depth, end = 0, -1
+            for i, ch in enumerate(clean[start:], start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end == -1:
+                logger.warning(f"[Categorizer] Unbalanced braces in response: {raw[:100]}")
+                return "unknown", 0.0
+            try:
+                data = json.loads(clean[start : end + 1])
+            except json.JSONDecodeError as exc:
+                logger.warning(f"[Categorizer] JSON parse error: {exc} | raw={raw[:100]}")
+                return "unknown", 0.0
 
         category = str(data.get("category", "unknown"))
         if category not in VALID_CATEGORIES:
@@ -262,9 +280,12 @@ class RoutingLogger:
         """Create routing_log table if it does not already exist."""
         import sqlite3
         try:
-            with sqlite3.connect(self._db_path) as conn:
+            conn = sqlite3.connect(self._db_path)
+            try:
                 conn.execute(_CREATE_ROUTING_LOG_SQL)
                 conn.commit()
+            finally:
+                conn.close()
         except Exception as exc:
             logger.error(
                 f"[RoutingLogger] Failed to initialise DB at {self._db_path}: {exc}"
@@ -304,12 +325,15 @@ class RoutingLogger:
         if source not in VALID_SOURCES:
             logger.warning(f"[RoutingLogger] Unknown source '{source}', storing anyway")
 
-        prompt_hash: str | None = None
-        if prompt is not None:
-            prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-
         try:
-            with sqlite3.connect(self._db_path) as conn:
+            # Derive hash inside try — guards against non-string prompt values.
+            prompt_hash: str | None = None
+            if prompt is not None:
+                prompt_hash = hashlib.sha256(str(prompt).encode()).hexdigest()
+                prompt = str(prompt)  # ensure stored value is always a string
+
+            conn = sqlite3.connect(self._db_path)
+            try:
                 conn.execute(
                     """
                     INSERT INTO routing_log (
@@ -333,6 +357,8 @@ class RoutingLogger:
                     ),
                 )
                 conn.commit()
+            finally:
+                conn.close()
             logger.debug(
                 f"[RoutingLogger] logged source={source} category={category} "
                 f"tier={selected_tier} latency_ms={latency_ms} pool_eligible={pool_eligible}"
@@ -363,6 +389,9 @@ class ModelRouter:
     """
 
     _ROUTER_VERSION = "phase2_llm"
+    # Maximum number of session entries kept in the in-process cache.
+    # Oldest entries are evicted (FIFO) once this limit is exceeded.
+    _MAX_SESSION_CACHE = 1000
 
     def __init__(
         self,
@@ -371,7 +400,17 @@ class ModelRouter:
     ) -> None:
         self._aliases = aliases
         self._cfg = routing_config
-        self._conv_context: dict[str, dict] = {}
+        # OrderedDict preserves insertion order for FIFO eviction at _MAX_SESSION_CACHE.
+        self._conv_context: OrderedDict[str, dict] = OrderedDict()
+
+        # Warn at construction time if any tier has no alias — easier to catch
+        # misconfiguration at startup than to silently forward an empty model string.
+        missing_tiers = set(CATEGORY_TIER_MAP.values()) - set(aliases)
+        if missing_tiers:
+            logger.warning(
+                f"[ModelRouter] No alias defined for tier(s) {missing_tiers} — "
+                "requests routing to these tiers will fall back to any available alias"
+            )
 
         # Resolve API key from environment
         api_key: str | None = None
@@ -444,6 +483,13 @@ class ModelRouter:
 
         tier = CATEGORY_TIER_MAP.get(category, "medium")
         model = self._aliases.get(tier, self._aliases.get("cheap", ""))
+        if not model:
+            # Last-resort fallback: pick any available alias rather than forward "".
+            model = next(iter(self._aliases.values()), "")
+            logger.warning(
+                f"[ModelRouter] No alias for tier '{tier}' or 'cheap' — "
+                f"falling back to '{model}'"
+            )
 
         pool_eligible = self._is_pool_eligible(category, confidence, text)
 
@@ -502,6 +548,8 @@ class ModelRouter:
         model: str,
         text: str,
     ) -> None:
+        # Move existing key to end so re-used sessions don't get prematurely evicted.
+        self._conv_context.pop(session_key, None)
         self._conv_context[session_key] = {
             "category": category,
             "tier":     tier,
@@ -509,6 +557,9 @@ class ModelRouter:
             "last_user_msg": text,
             "timestamp": time.time(),
         }
+        # Evict oldest entries beyond the cap (FIFO).
+        while len(self._conv_context) > self._MAX_SESSION_CACHE:
+            self._conv_context.popitem(last=False)
 
     def _is_pool_eligible(
         self, category: str, confidence: float, text: str
@@ -517,5 +568,6 @@ class ModelRouter:
         return (
             category != "unknown"
             and confidence >= self._cfg.confidence_threshold
+            and isinstance(text, str)
             and len(text) >= self._cfg.min_prompt_length_for_pool
         )
