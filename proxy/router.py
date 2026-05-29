@@ -191,33 +191,28 @@ class LLMCategorizer:
         clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
 
         # Try direct parse first (well-formed response with no surrounding prose).
-        # Fall back to balanced-brace extractor for responses with extra prose.
-        data: dict | None = None
+        # Fall back to raw_decode for responses with extra prose around the JSON.
+        # raw_decode is string-aware and correctly handles `{`/`}` inside string values.
+        data: Any = None
         try:
             data = json.loads(clean)
         except json.JSONDecodeError:
-            # Find first balanced JSON object (handles nested braces correctly).
             start = clean.find("{")
             if start == -1:
                 logger.warning(f"[Categorizer] No JSON object found in response: {raw[:100]}")
                 return "unknown", 0.0
-            depth, end = 0, -1
-            for i, ch in enumerate(clean[start:], start):
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            if end == -1:
-                logger.warning(f"[Categorizer] Unbalanced braces in response: {raw[:100]}")
-                return "unknown", 0.0
             try:
-                data = json.loads(clean[start : end + 1])
+                data, _ = json.JSONDecoder().raw_decode(clean, start)
             except json.JSONDecodeError as exc:
                 logger.warning(f"[Categorizer] JSON parse error: {exc} | raw={raw[:100]}")
                 return "unknown", 0.0
+
+        # Guard: LLM may return valid but non-object JSON (list, string, int, null).
+        if not isinstance(data, dict):
+            logger.warning(
+                f"[Categorizer] Expected JSON object, got {type(data).__name__}: {raw[:100]}"
+            )
+            return "unknown", 0.0
 
         category = str(data.get("category", "unknown"))
         if category not in VALID_CATEGORIES:
@@ -326,11 +321,13 @@ class RoutingLogger:
             logger.warning(f"[RoutingLogger] Unknown source '{source}', storing anyway")
 
         try:
-            # Derive hash inside try — guards against non-string prompt values.
+            # Only hash and store string prompts — discard non-string values (e.g.
+            # multimodal content lists) as NULL rather than storing a mangled repr.
             prompt_hash: str | None = None
-            if prompt is not None:
-                prompt_hash = hashlib.sha256(str(prompt).encode()).hexdigest()
-                prompt = str(prompt)  # ensure stored value is always a string
+            if isinstance(prompt, str):
+                prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+            else:
+                prompt = None  # non-string → NULL in DB (no-op if already None)
 
             conn = sqlite3.connect(self._db_path)
             try:
@@ -389,9 +386,6 @@ class ModelRouter:
     """
 
     _ROUTER_VERSION = "phase2_llm"
-    # Maximum number of session entries kept in the in-process cache.
-    # Oldest entries are evicted (FIFO) once this limit is exceeded.
-    _MAX_SESSION_CACHE = 1000
 
     def __init__(
         self,
@@ -400,7 +394,9 @@ class ModelRouter:
     ) -> None:
         self._aliases = aliases
         self._cfg = routing_config
-        # OrderedDict preserves insertion order for FIFO eviction at _MAX_SESSION_CACHE.
+        # Session cache size comes from config (max_session_cache_size).
+        # OrderedDict preserves insertion order for FIFO eviction.
+        self._max_session_cache: int = routing_config.max_session_cache_size
         self._conv_context: OrderedDict[str, dict] = OrderedDict()
 
         # Warn at construction time if any tier has no alias — easier to catch
@@ -557,8 +553,9 @@ class ModelRouter:
             "last_user_msg": text,
             "timestamp": time.time(),
         }
-        # Evict oldest entries beyond the cap (FIFO).
-        while len(self._conv_context) > self._MAX_SESSION_CACHE:
+        # Evict oldest entry if cap exceeded. One call adds at most one entry
+        # (existing key was popped first), so a single check suffices.
+        if len(self._conv_context) > self._max_session_cache:
             self._conv_context.popitem(last=False)
 
     def _is_pool_eligible(

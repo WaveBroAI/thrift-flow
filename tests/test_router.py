@@ -288,12 +288,30 @@ def test_parse_response_handles_prose_around_json():
 
 
 def test_parse_response_handles_nested_json():
-    """Fix #5: response with nested braces must not return unknown due to regex truncation."""
+    """Fix #5→#2: response with nested braces parses correctly via raw_decode."""
     cat = _categorizer()
     raw = '{"category": "coding", "meta": {"v": 1}, "confidence": 0.97}'
     category, confidence = cat._parse_response(raw)
     assert category == "coding"
     assert confidence == pytest.approx(0.97)
+
+
+def test_parse_response_handles_braces_inside_string_value():
+    """Fix #2: string value containing { and } must not fool the extractor."""
+    cat = _categorizer()
+    raw = 'Here: {"category": "coding", "note": "use { and } here", "confidence": 0.9}'
+    category, confidence = cat._parse_response(raw)
+    assert category == "coding"
+    assert confidence == pytest.approx(0.9)
+
+
+def test_parse_response_non_dict_json_returns_unknown():
+    """Fix #1: LLM returning a JSON array or scalar must not crash via .get()."""
+    cat = _categorizer()
+    assert cat._parse_response('["coding", 0.97]') == ("unknown", 0.0)
+    assert cat._parse_response('"casual"') == ("unknown", 0.0)
+    assert cat._parse_response('42') == ("unknown", 0.0)
+    assert cat._parse_response('null') == ("unknown", 0.0)
 
 
 def test_parse_response_no_json_object_returns_unknown():
@@ -526,8 +544,8 @@ def test_routing_logger_multiple_rows(tmp_path):
     assert count == 3
 
 
-def test_routing_logger_non_string_prompt_does_not_raise(tmp_path):
-    """Fix #2: passing a list as prompt must not crash via list.encode()."""
+def test_routing_logger_non_string_prompt_stores_null(tmp_path):
+    """Fix #2+#3: non-string prompt must not crash and must store NULL (not mangled repr)."""
     db = str(tmp_path / "test.db")
     rl = RoutingLogger(db)
     multimodal = [{"type": "text", "text": "fix my code"}]
@@ -543,9 +561,9 @@ def test_routing_logger_non_string_prompt_does_not_raise(tmp_path):
     with sqlite3.connect(db) as conn:
         rows = conn.execute("SELECT prompt, prompt_hash FROM routing_log").fetchall()
     assert len(rows) == 1
-    # Stored as str() representation, not empty
-    assert rows[0][0] is not None
-    assert rows[0][1] is not None
+    # Non-string prompt must be stored as NULL, not as Python repr
+    assert rows[0][0] is None
+    assert rows[0][1] is None
 
 
 # ── ModelRouter helpers ───────────────────────────────────────────────────────
@@ -917,47 +935,36 @@ def test_pool_eligible_non_string_text_is_false(tmp_path):
     assert router._is_pool_eligible("coding", 0.9, multimodal) is False  # type: ignore[arg-type]
 
 
-# ── ModelRouter — _conv_context size cap (Fix #3) ─────────────────────────────
+# ── ModelRouter — _conv_context size cap (Fix #3 + #6) ───────────────────────
 
 @pytest.mark.anyio
 async def test_conv_context_capped_at_max_size(tmp_path):
-    """Fix #3: _conv_context must not grow beyond _MAX_SESSION_CACHE entries."""
-    router, _ = _make_router(tmp_path)
-    # Temporarily lower the cap for the test
-    original_cap = router._MAX_SESSION_CACHE
-    router.__class__._MAX_SESSION_CACHE = 5
-    try:
-        with patch(
-            "proxy.router.litellm.acompletion",
-            new_callable=AsyncMock,
-            return_value=_cat_response("casual", 0.9),
-        ):
-            for i in range(10):
-                await router.route(f"msg {i}", [], session_key=f"session-{i}")
-    finally:
-        router.__class__._MAX_SESSION_CACHE = original_cap
+    """Fix #3+#6: _conv_context must not exceed max_session_cache_size entries."""
+    router, _ = _make_router(tmp_path, max_session_cache_size=5)
+    with patch(
+        "proxy.router.litellm.acompletion",
+        new_callable=AsyncMock,
+        return_value=_cat_response("casual", 0.9),
+    ):
+        for i in range(10):
+            await router.route(f"msg {i}", [], session_key=f"session-{i}")
     assert len(router._conv_context) <= 5
 
 
 def test_conv_context_update_moves_to_end(tmp_path):
-    """Fix #3: re-used session should not be evicted before a fresh one."""
-    from collections import OrderedDict
-    router, _ = _make_router(tmp_path)
-    router.__class__._MAX_SESSION_CACHE = 3
-    try:
-        # Seed 3 sessions
-        for key in ("a", "b", "c"):
-            router._conv_context[key] = {"category": "casual", "tier": "cheap",
-                                          "model": "m", "last_user_msg": "", "timestamp": 0.0}
-        # Update "a" — it should move to end and "b" (oldest) gets evicted on next insert
-        router._update_context("a", "coding", "strong", "m", "new")
-        # Add a new session "d" — cap exceeded, oldest (now "b") evicted
-        router._update_context("d", "casual", "cheap", "m", "hi")
-        assert "b" not in router._conv_context   # b was oldest after a moved to end
-        assert "a" in router._conv_context        # a was re-used, should survive
-        assert "d" in router._conv_context        # newly added
-    finally:
-        router.__class__._MAX_SESSION_CACHE = 1000
+    """Fix #3+#6: re-used session must not be evicted before a fresh one."""
+    router, _ = _make_router(tmp_path, max_session_cache_size=3)
+    # Seed 3 sessions directly
+    for key in ("a", "b", "c"):
+        router._conv_context[key] = {"category": "casual", "tier": "cheap",
+                                      "model": "m", "last_user_msg": "", "timestamp": 0.0}
+    # Update "a" — it should move to end; "b" is now the oldest
+    router._update_context("a", "coding", "strong", "m", "new")
+    # Add "d" — cap exceeded, oldest ("b") evicted
+    router._update_context("d", "casual", "cheap", "m", "hi")
+    assert "b" not in router._conv_context   # b was oldest after a moved to end
+    assert "a" in router._conv_context        # a was re-used, should survive
+    assert "d" in router._conv_context        # newly added
 
 
 # ── ModelRouter — missing alias fallback (Fix #4) ─────────────────────────────

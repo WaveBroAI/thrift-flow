@@ -58,3 +58,4 @@ routing:
   min_prompt_length_for_pool: 10     # min prompt chars for pool eligibility
   session_ttl_seconds: 1800          # session context cache TTL (30 min)
   categorizer_timeout: 5.0           # categorizer LLM call timeout (seconds)
+  max_session_cache_size: 1000       # max in-process session entries (FIFO eviction)

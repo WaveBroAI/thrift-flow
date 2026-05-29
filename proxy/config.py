@@ -45,6 +45,7 @@ class RoutingConfig:
     min_prompt_length_for_pool: int = 10          # min prompt chars for pool eligibility
     session_ttl_seconds: int = 1800               # session context cache TTL (seconds)
     categorizer_timeout: float = 5.0              # LLM categorizer timeout (seconds)
+    max_session_cache_size: int = 1000            # max in-process session cache entries
 
 
 @dataclass
@@ -89,6 +90,7 @@ class ProxyConfig:
             min_prompt_length_for_pool=routing_raw.get("min_prompt_length_for_pool", 10),
             session_ttl_seconds=routing_raw.get("session_ttl_seconds", 1800),
             categorizer_timeout=routing_raw.get("categorizer_timeout", 5.0),
+            max_session_cache_size=routing_raw.get("max_session_cache_size", 1000),
         )
 
         return cls(server=server, models=models, tracking=tracking, routing=routing)
