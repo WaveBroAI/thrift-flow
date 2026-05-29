@@ -137,11 +137,13 @@ async def test_context_is_included_as_separate_user_message():
         await cat.categorize("still broken", context="[Previous routing: coding, 5s ago]")
 
     call_messages = mock_ac.call_args.kwargs["messages"]
-    # system + context + user = 3 messages
+    # system + context + [Current message:] user = 3 messages
     assert len(call_messages) == 3
     assert call_messages[1]["role"] == "user"
     assert "[Previous routing:" in call_messages[1]["content"]
-    assert call_messages[2]["content"] == "still broken"
+    # Fix #1: text is labeled with [Current message:] when context is present,
+    # matching the three-line format described in _CATEGORIZER_SYSTEM_PROMPT.
+    assert call_messages[2]["content"] == "[Current message:] still broken"
 
 
 @pytest.mark.anyio
@@ -839,7 +841,7 @@ async def test_model_router_session_context_updated_after_route(tmp_path):
 async def test_model_router_build_context_returns_none_no_cache(tmp_path):
     """_build_context returns None when session has no prior cache entry."""
     router, _ = _make_router(tmp_path)
-    result = router._build_context("no-such-session", "some text")
+    result = router._build_context("no-such-session")
     assert result is None
 
 
@@ -853,7 +855,7 @@ async def test_model_router_build_context_deletes_expired_entry(tmp_path):
         "last_user_msg": "old",
         "timestamp": time.time() - 9999,
     }
-    result = router._build_context("s7", "new")
+    result = router._build_context("s7")
     assert result is None
     assert "s7" not in router._conv_context
 
@@ -874,6 +876,10 @@ async def test_model_router_logs_llm_categorizer_source(tmp_path):
             prompt_for_hash="fix this bug",
             session_key="s8",
         )
+    # Log write is fire-and-forget (asyncio.create_task); yield to let the task
+    # start and the SQLite thread complete before asserting DB contents.
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.05)
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM routing_log").fetchone()
@@ -899,6 +905,10 @@ async def test_model_router_logs_continuation_source(tmp_path):
             session_key="s9",
         )
     mock_ac.assert_not_called()
+    # Log write is fire-and-forget (asyncio.create_task); yield to let the task
+    # start and the SQLite thread complete before asserting DB contents.
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.05)
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT source, category FROM routing_log").fetchone()

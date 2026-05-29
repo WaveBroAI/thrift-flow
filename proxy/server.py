@@ -78,7 +78,9 @@ def create_app(config: ProxyConfig, tracker: Optional[RequestTracker]) -> FastAP
             _, model_resolved = await _model_router.route(
                 _last_user_msg,
                 messages,
-                prompt_for_hash=_last_user_msg,
+                # Pass None for empty text (multimodal/no-user-msg) so routing_log
+                # stores NULL rather than sha256("") for all such requests.
+                prompt_for_hash=_last_user_msg or None,
                 session_key=session_key,
             )
         else:

@@ -137,8 +137,12 @@ class LLMCategorizer:
 
         Args:
             text:    The user message to classify. Truncated to 2000 chars.
-            context: Optional context string prepended as a separate user message.
-                     Truncated to 2000 chars. Used for conversation continuity.
+            context: Optional prior-routing context string (built by
+                     ModelRouter._build_context). When provided, context is sent
+                     as one user message and text is sent as a second user message
+                     prefixed with "[Current message:]" — matching the three-line
+                     format described in _CATEGORIZER_SYSTEM_PROMPT.
+                     Truncated to 2000 chars.
 
         Returns:
             (category, confidence, latency_ms).
@@ -152,8 +156,15 @@ class LLMCategorizer:
             {"role": "system", "content": _CATEGORIZER_SYSTEM_PROMPT},
         ]
         if context:
+            # Send prior context then the current message with its label so the
+            # LLM receives the exact three-line format the system prompt describes:
+            #   [Previous routing: <cat>, <N>s ago]
+            #   [Previous message:] <prior user message>
+            #   [Current message:] <message to classify>
             messages.append({"role": "user", "content": context[:2000]})
-        messages.append({"role": "user", "content": text[:2000]})
+            messages.append({"role": "user", "content": f"[Current message:] {text[:2000]}"})
+        else:
+            messages.append({"role": "user", "content": text[:2000]})
 
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -272,11 +283,17 @@ class RoutingLogger:
         self._init_db()
 
     def _init_db(self) -> None:
-        """Create routing_log table if it does not already exist."""
+        """Create routing_log table if it does not already exist.
+
+        Also enables WAL journal mode so concurrent readers and writers don't
+        block each other (WAL is a persistent DB-level setting; subsequent
+        connections inherit it automatically).
+        """
         import sqlite3
         try:
             conn = sqlite3.connect(self._db_path)
             try:
+                conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(_CREATE_ROUTING_LOG_SQL)
                 conn.commit()
             finally:
@@ -458,7 +475,9 @@ class ModelRouter:
             cached = self._conv_context[session_key]
             tier = cached["tier"]
             model = cached["model"]
-            await asyncio.to_thread(
+            # Fire-and-forget: log write is analytics-only; don't block the
+            # response waiting for SQLite I/O.
+            asyncio.create_task(asyncio.to_thread(
                 self._routing_logger.log,
                 category=cached["category"],
                 selected_tier=tier,
@@ -467,11 +486,11 @@ class ModelRouter:
                 router_version=self._ROUTER_VERSION,
                 source="continuation",
                 prompt=prompt_for_hash,
-            )
+            ))
             return tier, model
 
         # ── normal path: call categorizer ─────────────────────────────────────
-        context = self._build_context(session_key, text) if session_key else None
+        context = self._build_context(session_key) if session_key else None
 
         category, confidence, latency_ms = await self._categorizer.categorize(
             text, context=context
@@ -492,7 +511,9 @@ class ModelRouter:
         if session_key:
             self._update_context(session_key, category, tier, model, text)
 
-        await asyncio.to_thread(
+        # Fire-and-forget: log write is analytics-only; don't block the
+        # response waiting for SQLite I/O.
+        asyncio.create_task(asyncio.to_thread(
             self._routing_logger.log,
             category=category,
             selected_tier=tier,
@@ -504,7 +525,7 @@ class ModelRouter:
             pool_eligible=pool_eligible,
             prompt=prompt_for_hash,
             latency_ms=latency_ms,
-        )
+        ))
 
         return tier, model
 
@@ -522,8 +543,14 @@ class ModelRouter:
             return False
         return (time.time() - cached["timestamp"]) <= self._cfg.session_ttl_seconds
 
-    def _build_context(self, session_key: str, current_text: str) -> str | None:
-        """Return prior-context hint string, or None if cache missing / expired."""
+    def _build_context(self, session_key: str) -> str | None:
+        """Return prior-context hint string, or None if cache missing / expired.
+
+        Returned string contains the first two lines of the three-line context
+        format described in _CATEGORIZER_SYSTEM_PROMPT. The third line
+        ([Current message:]) is added by LLMCategorizer.categorize() when it
+        assembles the messages list.
+        """
         cached = self._conv_context.get(session_key)
         if not cached:
             return None
