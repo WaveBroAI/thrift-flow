@@ -26,6 +26,25 @@ import litellm
 
 logger = logging.getLogger(__name__)
 
+# ── Background task GC guard ──────────────────────────────────────────────────
+# asyncio._all_tasks is a WeakSet — a Task with no other reference can be GC'd
+# before it runs. This module-level set holds strong references until done.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_background(coro) -> None:
+    """Schedule *coro* as a fire-and-forget task, holding a strong reference.
+
+    Without this guard, a Task created by asyncio.create_task() can be
+    garbage-collected before the event loop runs it — the Python docs explicitly
+    warn to "save a reference to avoid a task disappearing mid-execution."
+    The done-callback removes the strong reference once the task completes.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 # ── Category taxonomy ─────────────────────────────────────────────────────────
 
 VALID_CATEGORIES = frozenset({
@@ -285,17 +304,26 @@ class RoutingLogger:
     def _init_db(self) -> None:
         """Create routing_log table if it does not already exist.
 
-        Also enables WAL journal mode so concurrent readers and writers don't
-        block each other (WAL is a persistent DB-level setting; subsequent
-        connections inherit it automatically).
+        WAL journal mode is enabled as a best-effort step *after* the table is
+        created, so a read-only or WAL-unsupported filesystem only loses the
+        concurrency improvement — the table itself is always present if the DB
+        is writable at all.
         """
         import sqlite3
         try:
             conn = sqlite3.connect(self._db_path)
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
+                # Create table first — this is the critical operation.
                 conn.execute(_CREATE_ROUTING_LOG_SQL)
                 conn.commit()
+                # WAL improves concurrent reader/writer throughput; best-effort:
+                # silently skip on read-only DBs or filesystems without WAL support.
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                except Exception as wal_exc:
+                    logger.warning(
+                        f"[RoutingLogger] WAL mode unavailable at {self._db_path}: {wal_exc}"
+                    )
             finally:
                 conn.close()
         except Exception as exc:
@@ -477,7 +505,7 @@ class ModelRouter:
             model = cached["model"]
             # Fire-and-forget: log write is analytics-only; don't block the
             # response waiting for SQLite I/O.
-            asyncio.create_task(asyncio.to_thread(
+            _schedule_background(asyncio.to_thread(
                 self._routing_logger.log,
                 category=cached["category"],
                 selected_tier=tier,
@@ -513,7 +541,7 @@ class ModelRouter:
 
         # Fire-and-forget: log write is analytics-only; don't block the
         # response waiting for SQLite I/O.
-        asyncio.create_task(asyncio.to_thread(
+        _schedule_background(asyncio.to_thread(
             self._routing_logger.log,
             category=category,
             selected_tier=tier,

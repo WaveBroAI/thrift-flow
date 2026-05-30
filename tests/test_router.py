@@ -5,6 +5,7 @@ No real LLM calls or API keys needed: litellm.acompletion is mocked throughout.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -21,6 +22,7 @@ from proxy.router import (
     LLMCategorizer,
     ModelRouter,
     RoutingLogger,
+    _background_tasks,
 )
 
 
@@ -876,10 +878,11 @@ async def test_model_router_logs_llm_categorizer_source(tmp_path):
             prompt_for_hash="fix this bug",
             session_key="s8",
         )
-    # Log write is fire-and-forget (asyncio.create_task); yield to let the task
-    # start and the SQLite thread complete before asserting DB contents.
-    import asyncio as _asyncio
-    await _asyncio.sleep(0.05)
+    # Drain routing-log background tasks deterministically — targeted to the
+    # module-level _background_tasks set, not all_tasks() which includes
+    # framework tasks that never complete.
+    if _background_tasks:
+        await asyncio.gather(*list(_background_tasks), return_exceptions=True)
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM routing_log").fetchone()
@@ -905,10 +908,11 @@ async def test_model_router_logs_continuation_source(tmp_path):
             session_key="s9",
         )
     mock_ac.assert_not_called()
-    # Log write is fire-and-forget (asyncio.create_task); yield to let the task
-    # start and the SQLite thread complete before asserting DB contents.
-    import asyncio as _asyncio
-    await _asyncio.sleep(0.05)
+    # Drain routing-log background tasks deterministically — targeted to the
+    # module-level _background_tasks set, not all_tasks() which includes
+    # framework tasks that never complete.
+    if _background_tasks:
+        await asyncio.gather(*list(_background_tasks), return_exceptions=True)
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT source, category FROM routing_log").fetchone()

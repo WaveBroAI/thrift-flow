@@ -51,6 +51,11 @@ class RequestTracker:
     def _init_db(self) -> None:
         with self._lock:
             with self._connect() as conn:
+                # Enable WAL journal mode for better concurrent reader/writer
+                # throughput. WAL is a persistent DB-level setting — all
+                # subsequent connections (including RoutingLogger's) inherit it
+                # automatically regardless of which class initialises the DB first.
+                conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(self._CREATE_TABLE)
                 conn.execute(self._CREATE_INDEX_TS)
                 conn.execute(self._CREATE_INDEX_CLIENT)
