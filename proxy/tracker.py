@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class RequestTracker:
@@ -55,7 +58,14 @@ class RequestTracker:
                 # throughput. WAL is a persistent DB-level setting — all
                 # subsequent connections (including RoutingLogger's) inherit it
                 # automatically regardless of which class initialises the DB first.
-                conn.execute("PRAGMA journal_mode=WAL")
+                # Best-effort: a read-only DB or WAL-unsupported filesystem must
+                # not prevent the table from being created or crash the server.
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                except Exception as wal_exc:
+                    logger.warning(
+                        f"[RequestTracker] WAL mode unavailable at {self._db_path}: {wal_exc}"
+                    )
                 conn.execute(self._CREATE_TABLE)
                 conn.execute(self._CREATE_INDEX_TS)
                 conn.execute(self._CREATE_INDEX_CLIENT)
