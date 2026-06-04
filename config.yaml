@@ -59,3 +59,8 @@ routing:
   session_ttl_seconds: 1800          # session context cache TTL (30 min)
   categorizer_timeout: 5.0           # categorizer LLM call timeout (seconds)
   max_session_cache_size: 1000       # max in-process session entries (FIFO eviction)
+  embedding_enabled: false           # false / "shadow" / true
+  embedding_model: "intfloat/multilingual-e5-small"
+  embedding_k: 5
+  embedding_min_pool_size: 20
+  embedding_pool_cache_ttl: 300.0    # pool cache TTL in seconds

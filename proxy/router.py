@@ -6,10 +6,14 @@ tiers (cheap / medium / strong).  All routing decisions are persisted to a
 SQLite routing_log table (separate from request_log, same DB file).
 
 Classes:
-  LLMCategorizer  — async classify a prompt via a cheap LLM (e.g. Groq)
-  RoutingLogger   — persist routing decisions to routing_log table
+  LLMCategorizer   — async classify a prompt via a cheap LLM (e.g. Groq)
+  RoutingLogger    — persist routing decisions to routing_log table
+  EmbeddingRouter  — k-NN embedding lookup (shadow/live mode)
+  ModelRouter      — orchestrates categorizer + logger + embedding router
 
-Phase 2 (EmbeddingRouter + ModelRouter) is implemented in a later PR.
+Phase 2: EmbeddingRouter — k-NN embedding lookup (shadow/live mode).
+  shadow: k-NN runs alongside LLM categorizer, result logged but not used for routing.
+  live:   k-NN result used when pool is large enough; LLM categorizer as fallback.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from collections import OrderedDict
 from typing import Any
@@ -50,7 +55,6 @@ def _schedule_background(coro) -> None:
 VALID_CATEGORIES = frozenset({
     "casual",
     "simple_lookup",
-    "research_lookup",
     "creative",
     "analysis",
     "coding",
@@ -58,16 +62,15 @@ VALID_CATEGORIES = frozenset({
     "unknown",
 })
 
-# category → tier mapping  (tier_mapping_version: v1)
+# category → tier mapping  (tier_mapping_version: v2)
 CATEGORY_TIER_MAP: dict[str, str] = {
-    "casual":           "cheap",
-    "simple_lookup":    "cheap",
-    "research_lookup":  "medium",
-    "creative":         "medium",
-    "analysis":         "medium",
-    "coding":           "strong",
-    "reasoning":        "strong",
-    "unknown":          "medium",   # conservative default
+    "casual":        "cheap",
+    "simple_lookup": "cheap",
+    "creative":      "medium",
+    "analysis":      "medium",   # covers both explaining/summarising AND research/expert-domain
+    "coding":        "strong",
+    "reasoning":     "strong",
+    "unknown":       "medium",   # conservative default
 }
 
 # ── Categorizer system prompt ─────────────────────────────────────────────────
@@ -80,13 +83,12 @@ Categories:
 "how are you", "thank you", "haha")
 - simple_lookup: Direct factual questions with short, self-contained answers \
 (definitions, translations, "what is X", "who is Y", "when did Z happen")
-- research_lookup: Questions requiring synthesis of current, complex, or \
-expert-domain information (regulations, medical, financial, legal, \
-"latest policy on X", "compare regulatory options for Y")
 - creative: Generating original content (stories, poems, marketing copy, \
 slogans, character names, scripts)
-- analysis: Explaining concepts, summarizing text, comparing items, analyzing \
-content already provided by the user
+- analysis: Explaining, summarising, comparing, or analysing any topic — whether \
+content already provided by the user OR questions requiring synthesis of \
+external/expert-domain information (regulations, medical, financial, legal, \
+current events, "latest policy on X", "compare A and B")
 - coding: Writing code, debugging, code review, explaining code, software or \
 system architecture design
 - reasoning: Multi-step logic, planning, decision-making with tradeoffs, math \
@@ -97,7 +99,7 @@ Examples:
 - "morning!" → {"category": "casual", "confidence": 0.98}
 - "what does 'ephemeral' mean?" → {"category": "simple_lookup", "confidence": 0.95}
 - "what are the current GDPR requirements for cookie consent?" → \
-{"category": "research_lookup", "confidence": 0.90}
+{"category": "analysis", "confidence": 0.90}
 - "write me a birthday poem for my cat" → {"category": "creative", "confidence": 0.96}
 - "summarize this article for me" → {"category": "analysis", "confidence": 0.92}
 - "fix this Python TypeError: list index out of range" → \
@@ -110,12 +112,12 @@ If the message is preceded by context lines in this format:
   [Previous message:] <prior user message>
   [Current message:] <message to classify>
 Use the previous routing context to inform your decision. Follow-up refinements,
-corrections, or additions within a coding/analysis/reasoning/creative/research_lookup
+corrections, or additions within a coding/analysis/reasoning/creative
 conversation should remain in the same category unless the current message clearly
 shifts topic.
 
 Respond with valid JSON only, no other text:
-{"category": "<one of the 8 categories>", "confidence": <float 0.0–1.0>}
+{"category": "<one of the 7 categories>", "confidence": <float 0.0–1.0>}
 """
 
 
@@ -264,24 +266,35 @@ class LLMCategorizer:
 
 _CREATE_ROUTING_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS routing_log (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp            DATETIME DEFAULT CURRENT_TIMESTAMP,
-    prompt_hash          TEXT,
-    prompt               TEXT,
-    category             TEXT    NOT NULL,
-    category_confidence  REAL,
-    selected_tier        TEXT    NOT NULL,
-    tier_mapping_version TEXT    NOT NULL,
-    model_used           TEXT    NOT NULL,
-    router_version       TEXT    NOT NULL,
-    source               TEXT    NOT NULL,
-    pool_eligible        INTEGER NOT NULL DEFAULT 0,
-    latency_ms           REAL
+    id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp                      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    prompt_hash                    TEXT,
+    prompt                         TEXT,
+    category                       TEXT    NOT NULL,
+    category_confidence            REAL,
+    selected_tier                  TEXT    NOT NULL,
+    tier_mapping_version           TEXT    NOT NULL,
+    model_used                     TEXT    NOT NULL,
+    router_version                 TEXT    NOT NULL,
+    source                         TEXT    NOT NULL,
+    pool_eligible                  INTEGER NOT NULL DEFAULT 0,
+    latency_ms                     REAL,
+    embedding                      BLOB,
+    embedding_predicted_category   TEXT,
+    embedding_predicted_confidence REAL
 );
 """
 
+# Migration list: (column_name, sql_type) for columns added after initial schema.
+# Applied at init time so existing DBs are upgraded automatically.
+_ROUTING_LOG_MIGRATIONS = [
+    ("embedding",                      "BLOB"),
+    ("embedding_predicted_category",   "TEXT"),
+    ("embedding_predicted_confidence", "REAL"),
+]
+
 # Valid source values — enforced at write time (warn, not reject)
-VALID_SOURCES = frozenset({"llm_categorizer", "default", "continuation"})
+VALID_SOURCES = frozenset({"llm_categorizer", "default", "continuation", "embedding_lookup"})
 
 
 class RoutingLogger:
@@ -308,8 +321,10 @@ class RoutingLogger:
         created, so a read-only or WAL-unsupported filesystem only loses the
         concurrency improvement — the table itself is always present if the DB
         is writable at all.
+
+        Schema migrations for new columns are applied after table creation so
+        existing DBs are upgraded automatically without data loss.
         """
-        import sqlite3
         try:
             conn = sqlite3.connect(self._db_path)
             try:
@@ -324,6 +339,25 @@ class RoutingLogger:
                     logger.warning(
                         f"[RoutingLogger] WAL mode unavailable at {self._db_path}: {wal_exc}"
                     )
+                # Apply schema migrations for existing DBs that predate new columns.
+                existing_cols = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(routing_log)").fetchall()
+                }
+                for col_name, col_type in _ROUTING_LOG_MIGRATIONS:
+                    if col_name not in existing_cols:
+                        try:
+                            conn.execute(
+                                f"ALTER TABLE routing_log ADD COLUMN {col_name} {col_type}"
+                            )
+                            conn.commit()
+                            logger.info(
+                                f"[RoutingLogger] Migrated: added column '{col_name}' ({col_type})"
+                            )
+                        except Exception as mig_exc:
+                            logger.warning(
+                                f"[RoutingLogger] Migration failed for column '{col_name}': {mig_exc}"
+                            )
             finally:
                 conn.close()
         except Exception as exc:
@@ -344,23 +378,28 @@ class RoutingLogger:
         pool_eligible: bool = False,
         prompt: str | None = None,
         latency_ms: float | None = None,
+        embedding: bytes | None = None,
+        embedding_predicted_category: str | None = None,
+        embedding_predicted_confidence: float | None = None,
     ) -> None:
         """Write one routing decision row. Never raises.
 
         Args:
-            category:             task category (one of VALID_CATEGORIES)
-            selected_tier:        resolved tier (cheap / medium / strong)
-            tier_mapping_version: tag for the category→tier mapping version
-            model_used:           LiteLLM model string
-            router_version:       which routing path was active
-            source:               one of VALID_SOURCES
-            category_confidence:  float [0, 1] or None for non-LLM paths
-            pool_eligible:        True if quality gate passed for embedding pool
-            prompt:               raw prompt text — SHA-256 hash also derived
-            latency_ms:           time for the LLM categorizer call (ms)
+            category:                      task category (one of VALID_CATEGORIES)
+            selected_tier:                 resolved tier (cheap / medium / strong)
+            tier_mapping_version:          tag for the category→tier mapping version
+            model_used:                    LiteLLM model string
+            router_version:                which routing path was active
+            source:                        one of VALID_SOURCES
+            category_confidence:           float [0, 1] or None for non-LLM paths
+            pool_eligible:                 True if quality gate passed for embedding pool
+            prompt:                        raw prompt text — SHA-256 hash also derived
+            latency_ms:                    time for the LLM categorizer call (ms)
+            embedding:                     passage embedding as raw float32 bytes (or None)
+            embedding_predicted_category:  k-NN predicted category (or None)
+            embedding_predicted_confidence: k-NN prediction confidence (or None)
         """
         import hashlib
-        import sqlite3
 
         if source not in VALID_SOURCES:
             logger.warning(f"[RoutingLogger] Unknown source '{source}', storing anyway")
@@ -381,8 +420,10 @@ class RoutingLogger:
                     INSERT INTO routing_log (
                         prompt_hash, prompt, category, category_confidence,
                         selected_tier, tier_mapping_version, model_used,
-                        router_version, source, pool_eligible, latency_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        router_version, source, pool_eligible, latency_ms,
+                        embedding, embedding_predicted_category,
+                        embedding_predicted_confidence
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         prompt_hash,
@@ -396,6 +437,9 @@ class RoutingLogger:
                         source,
                         1 if pool_eligible else 0,
                         latency_ms,
+                        embedding,
+                        embedding_predicted_category,
+                        embedding_predicted_confidence,
                     ),
                 )
                 conn.commit()
@@ -407,6 +451,191 @@ class RoutingLogger:
             )
         except Exception as exc:
             logger.error(f"[RoutingLogger] Failed to write routing_log: {exc}")
+
+
+# ── EmbeddingRouter ────────────────────────────────────────────────────────────
+
+class EmbeddingRouter:
+    """Phase 2: multilingual-e5-small k-NN routing.
+
+    Uses intfloat/multilingual-e5-small (384-dim) to embed prompts and find the
+    k nearest neighbours in the routing pool to predict the task category.
+
+    Prefix convention required by the e5 model family:
+      Incoming routing queries  → embed with "query: " prefix
+      Pool entries (stored)     → embed with "passage: " prefix
+
+    The model is lazy-loaded on first use via asyncio.to_thread so the event loop
+    is never blocked. If sentence-transformers is not installed or the model fails
+    to load, all methods degrade silently — embed_query/embed_passage return None,
+    lookup returns ("unknown", 0.0).
+
+    Pool is loaded from SQLite and cached in memory (TTL = pool_cache_ttl seconds).
+    """
+
+    EMBEDDING_DIM = 384  # intfloat/multilingual-e5-small output dimension
+
+    def __init__(
+        self,
+        db_path: str,
+        model_name: str = "intfloat/multilingual-e5-small",
+        k: int = 5,
+        min_pool_size: int = 20,
+        pool_cache_ttl: float = 300.0,
+    ) -> None:
+        self._db_path = db_path
+        self._model_name = model_name
+        self._k = k
+        self._min_pool_size = min_pool_size
+        self._pool_cache_ttl = pool_cache_ttl
+        self._model = None
+        self._available: bool | None = None   # None = not yet attempted
+        self._pool_cache: dict[int, tuple[str, Any]] = {}
+        self._pool_loaded_at: float = 0.0
+
+    # ── Model lifecycle ───────────────────────────────────────────────────────
+
+    def _ensure_model(self) -> bool:
+        """Load the embedding model if not already loaded. Sync — call via to_thread.
+
+        Returns True if the model is available, False if it could not be loaded.
+        Subsequent calls short-circuit using the cached _available flag.
+        """
+        if self._available is not None:
+            return self._available
+        try:
+            from sentence_transformers import SentenceTransformer
+            import numpy as np
+            self._model = SentenceTransformer(self._model_name)
+            test = self._model.encode(["test"], normalize_embeddings=True)
+            dim = test.shape[1]
+            if dim != self.EMBEDDING_DIM:
+                logger.error(
+                    f"[EmbeddingRouter] Expected {self.EMBEDDING_DIM}-dim embedding, "
+                    f"got {dim} — model '{self._model_name}' may be wrong"
+                )
+                self._available = False
+                return False
+            self._available = True
+            logger.info(f"[EmbeddingRouter] Loaded '{self._model_name}' ({self.EMBEDDING_DIM}-dim)")
+            return True
+        except Exception as e:
+            logger.error(
+                f"[EmbeddingRouter] Failed to load model '{self._model_name}': {e}. "
+                "Install sentence-transformers to enable embedding routing."
+            )
+            self._available = False
+            return False
+
+    # ── Embedding ─────────────────────────────────────────────────────────────
+
+    def embed_query(self, text: str) -> "Any | None":
+        """Embed an incoming prompt with 'query: ' prefix. Sync — call via to_thread.
+
+        Returns a float32 numpy array of shape (384,), or None if unavailable.
+        """
+        if not self._ensure_model():
+            return None
+        try:
+            import numpy as np
+            result = self._model.encode([f"query: {text}"], normalize_embeddings=True)
+            return result[0].astype(np.float32)
+        except Exception as e:
+            logger.warning(f"[EmbeddingRouter] embed_query failed: {e}")
+            return None
+
+    def embed_passage(self, text: str) -> "Any | None":
+        """Embed a pool entry with 'passage: ' prefix. Sync — call via to_thread.
+
+        Returns a float32 numpy array of shape (384,), or None if unavailable.
+        """
+        if not self._ensure_model():
+            return None
+        try:
+            import numpy as np
+            result = self._model.encode([f"passage: {text}"], normalize_embeddings=True)
+            return result[0].astype(np.float32)
+        except Exception as e:
+            logger.warning(f"[EmbeddingRouter] embed_passage failed: {e}")
+            return None
+
+    # ── Pool management ───────────────────────────────────────────────────────
+
+    def _load_pool(self) -> "dict[int, tuple[str, Any]]":
+        """Load pool entries from DB with TTL-based in-memory caching. Sync — call via to_thread.
+
+        Only entries with pool_eligible=1 AND embedding IS NOT NULL are loaded.
+        Embeddings with unexpected dimensions are silently skipped.
+        """
+        now = time.monotonic()
+        if self._pool_cache and (now - self._pool_loaded_at) < self._pool_cache_ttl:
+            return self._pool_cache
+
+        pool: dict[int, tuple[str, Any]] = {}
+        try:
+            import numpy as np
+            with sqlite3.connect(self._db_path) as conn:
+                rows = conn.execute(
+                    "SELECT id, category, embedding FROM routing_log "
+                    "WHERE pool_eligible=1 AND embedding IS NOT NULL"
+                ).fetchall()
+            for row_id, category, emb_bytes in rows:
+                if not emb_bytes:
+                    continue
+                emb = np.frombuffer(emb_bytes, dtype=np.float32).copy()
+                if emb.shape[0] != self.EMBEDDING_DIM:
+                    continue  # skip malformed entries silently
+                pool[row_id] = (category, emb)
+            logger.debug(f"[EmbeddingRouter] Loaded {len(pool)} pool entries from DB")
+        except Exception as e:
+            logger.warning(f"[EmbeddingRouter] Failed to load pool from DB: {e}")
+
+        self._pool_cache = pool
+        self._pool_loaded_at = now
+        return pool
+
+    def invalidate_pool_cache(self) -> None:
+        """Force a pool reload on the next lookup call."""
+        self._pool_cache.clear()
+        self._pool_loaded_at = 0.0
+
+    # ── k-NN lookup ───────────────────────────────────────────────────────────────
+
+    def lookup(self, query_emb: "Any") -> tuple[str, float]:
+        """k-NN lookup against the embedding pool. Sync — call via to_thread.
+
+        Returns (category, confidence) where confidence is the fraction of the k
+        nearest neighbours that agree on the winning category.
+        Returns ("unknown", 0.0) when pool is too small or on any error.
+        """
+        pool = self._load_pool()
+        if len(pool) < self._min_pool_size:
+            logger.debug(
+                f"[EmbeddingRouter] Pool too small ({len(pool)} < {self._min_pool_size}), "
+                "skipping k-NN lookup"
+            )
+            return "unknown", 0.0
+
+        try:
+            import numpy as np
+            from collections import Counter
+            ids = list(pool.keys())
+            categories = [pool[i][0] for i in ids]
+            matrix = np.stack([pool[i][1] for i in ids])   # (N, 384)
+            sims = matrix @ query_emb                        # cosine similarity (L2-normalised)
+            top_k_indices = np.argsort(sims)[-self._k:][::-1]
+            top_cats = [categories[i] for i in top_k_indices]
+            counter = Counter(top_cats)
+            winner, count = counter.most_common(1)[0]
+            confidence = float(count) / self._k
+            logger.debug(
+                f"[EmbeddingRouter] k-NN winner={winner} conf={confidence:.2f} "
+                f"top_cats={top_cats}"
+            )
+            return winner, confidence
+        except Exception as e:
+            logger.warning(f"[EmbeddingRouter] lookup failed: {e}")
+            return "unknown", 0.0
 
 
 # ── ModelRouter ───────────────────────────────────────────────────────────────
@@ -430,8 +659,6 @@ class ModelRouter:
     Never raises — degrades to (medium, medium_model) on any unhandled error.
     """
 
-    _ROUTER_VERSION = "phase2_llm"
-
     def __init__(
         self,
         aliases: dict[str, str],
@@ -439,6 +666,7 @@ class ModelRouter:
     ) -> None:
         self._aliases = aliases
         self._cfg = routing_config
+        self._embedding_enabled = routing_config.embedding_enabled
         # Session cache size comes from config (max_session_cache_size).
         # OrderedDict preserves insertion order for FIFO eviction.
         self._max_session_cache: int = routing_config.max_session_cache_size
@@ -473,6 +701,25 @@ class ModelRouter:
             timeout=routing_config.categorizer_timeout,
         )
         self._routing_logger = RoutingLogger(routing_config.db)
+
+        # EmbeddingRouter: only created when embedding is enabled (shadow or live)
+        self._embedder: EmbeddingRouter | None = (
+            EmbeddingRouter(
+                db_path=routing_config.db,
+                model_name=routing_config.embedding_model,
+                k=routing_config.embedding_k,
+                min_pool_size=routing_config.embedding_min_pool_size,
+                pool_cache_ttl=routing_config.embedding_pool_cache_ttl,
+            ) if routing_config.embedding_enabled else None
+        )
+
+    @property
+    def _ROUTER_VERSION(self) -> str:
+        if self._embedding_enabled == "shadow":
+            return "phase2_shadow"
+        elif self._embedding_enabled:
+            return "phase2_embedding"
+        return "phase1_llm"
 
     async def route(
         self,
@@ -539,9 +786,75 @@ class ModelRouter:
         if session_key:
             self._update_context(session_key, category, tier, model, text)
 
-        # Fire-and-forget: log write is analytics-only; don't block the
-        # response waiting for SQLite I/O.
-        _schedule_background(asyncio.to_thread(
+        # ── Phase 2: embedding shadow/live ────────────────────────────────────
+        emb_pred_category: str | None = None
+        emb_pred_confidence: float | None = None
+
+        if self._embedder is not None:
+            # Embed query and do k-NN lookup (both CPU-bound — run in thread)
+            query_emb = await asyncio.to_thread(self._embedder.embed_query, text)
+            if query_emb is not None:
+                pred_cat, pred_conf = await asyncio.to_thread(
+                    self._embedder.lookup, query_emb
+                )
+                if pred_cat != "unknown":
+                    emb_pred_category = pred_cat
+                    emb_pred_confidence = pred_conf
+                    logger.info(
+                        f"[Router] embedding_knn={pred_cat} conf={pred_conf:.2f} "
+                        f"(llm={category})"
+                    )
+                    # In live mode, override tier/model with embedding prediction.
+                    # Shadow mode (embedding_enabled == "shadow") logs only — no override.
+                    if self._embedding_enabled is True:
+                        category = pred_cat
+                        tier = CATEGORY_TIER_MAP.get(category, "medium")
+                        model = self._aliases.get(tier, self._aliases.get("cheap", ""))
+                        if not model:
+                            model = next(iter(self._aliases.values()), "")
+
+        # Fire-and-forget: embed passage + write log in a single background coroutine
+        # so the passage embedding is stored atomically with the routing row.
+        _schedule_background(self._embed_and_log(
+            text=text,
+            category=category,
+            tier=tier,
+            model=model,
+            confidence=confidence,
+            pool_eligible=pool_eligible,
+            prompt_for_hash=prompt_for_hash,
+            latency_ms=latency_ms,
+            emb_pred_category=emb_pred_category,
+            emb_pred_confidence=emb_pred_confidence,
+        ))
+
+        return tier, model
+
+    async def _embed_and_log(
+        self,
+        *,
+        text: str,
+        category: str,
+        tier: str,
+        model: str,
+        confidence: float,
+        pool_eligible: bool,
+        prompt_for_hash: str | None,
+        latency_ms: float | None,
+        emb_pred_category: str | None,
+        emb_pred_confidence: float | None,
+    ) -> None:
+        """Compute passage embedding (if pool-eligible) and write routing_log row.
+
+        Runs as a fire-and-forget background task so it never blocks the response.
+        """
+        embedding_bytes: bytes | None = None
+        if pool_eligible and self._embedder is not None and isinstance(text, str) and text:
+            passage_emb = await asyncio.to_thread(self._embedder.embed_passage, text)
+            if passage_emb is not None:
+                embedding_bytes = passage_emb.tobytes()
+
+        await asyncio.to_thread(
             self._routing_logger.log,
             category=category,
             selected_tier=tier,
@@ -553,9 +866,10 @@ class ModelRouter:
             pool_eligible=pool_eligible,
             prompt=prompt_for_hash,
             latency_ms=latency_ms,
-        ))
-
-        return tier, model
+            embedding=embedding_bytes,
+            embedding_predicted_category=emb_pred_category,
+            embedding_predicted_confidence=emb_pred_confidence,
+        )
 
     # ── private helpers ───────────────────────────────────────────────────────
 

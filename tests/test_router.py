@@ -19,6 +19,7 @@ from proxy.router import (
     CATEGORY_TIER_MAP,
     VALID_CATEGORIES,
     VALID_SOURCES,
+    EmbeddingRouter,
     LLMCategorizer,
     ModelRouter,
     RoutingLogger,
@@ -42,8 +43,8 @@ def _categorizer(model: str = "groq/llama-3.1-8b-instant", **kw) -> LLMCategoriz
 
 # ── constants sanity checks ───────────────────────────────────────────────────
 
-def test_valid_categories_has_eight_entries():
-    assert len(VALID_CATEGORIES) == 8
+def test_valid_categories_has_seven_entries():
+    assert len(VALID_CATEGORIES) == 7
 
 
 def test_every_category_has_a_tier():
@@ -58,6 +59,7 @@ def test_valid_sources_contains_expected_values():
     assert "llm_categorizer" in VALID_SOURCES
     assert "default" in VALID_SOURCES
     assert "continuation" in VALID_SOURCES
+    assert "embedding_lookup" in VALID_SOURCES
 
 
 # ── LLMCategorizer.categorize — empty / whitespace / non-string ──────────────
@@ -889,7 +891,7 @@ async def test_model_router_logs_llm_categorizer_source(tmp_path):
     assert row["source"] == "llm_categorizer"
     assert row["category"] == "coding"
     assert row["selected_tier"] == "strong"
-    assert row["router_version"] == "phase2_llm"
+    assert row["router_version"] == "phase1_llm"
 
 
 @pytest.mark.anyio
@@ -1009,3 +1011,39 @@ def test_model_router_warns_on_missing_tier_alias(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="proxy.router"):
         _make_router(tmp_path, aliases=aliases_sparse)
     assert "No alias defined for tier" in caplog.text
+
+
+# ── EmbeddingRouter ───────────────────────────────────────────────────────────
+
+def test_embedding_router_degrades_when_not_installed(tmp_path):
+    """When sentence-transformers is absent/blocked, embed_query returns None."""
+    import sys
+    db = str(tmp_path / "emb.db")
+    RoutingLogger(db)  # create schema so EmbeddingRouter can open the DB
+    er = EmbeddingRouter(db_path=db, min_pool_size=1)
+    # Block the sentence_transformers import so _ensure_model() fails
+    with patch.dict(sys.modules, {"sentence_transformers": None}):
+        result = er.embed_query("hello world")
+    assert result is None
+
+
+def test_embedding_router_pool_too_small_returns_unknown(tmp_path):
+    """lookup() returns ('unknown', 0.0) when pool has fewer rows than min_pool_size."""
+    db = str(tmp_path / "emb.db")
+    RoutingLogger(db)  # create schema (with embedding column)
+    er = EmbeddingRouter(db_path=db, min_pool_size=20)
+    # Pool is empty — well below min_pool_size=20
+    category, confidence = er.lookup(query_emb=None)
+    assert category == "unknown"
+    assert confidence == 0.0
+
+
+def test_embedding_router_empty_pool_returns_unknown(tmp_path):
+    """lookup() returns ('unknown', 0.0) when pool is completely empty."""
+    db = str(tmp_path / "emb.db")
+    RoutingLogger(db)
+    er = EmbeddingRouter(db_path=db, min_pool_size=1)
+    # No rows in DB at all
+    category, confidence = er.lookup(query_emb=None)
+    assert category == "unknown"
+    assert confidence == 0.0
