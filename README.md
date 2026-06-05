@@ -178,6 +178,15 @@ Every routing decision is stored in `routing_log` alongside the request log.
 
 ---
 
+## Documentation
+
+| Document | Description |
+|---|---|
+| [docs/ROUTING.md](docs/ROUTING.md) | Deep dive into adaptive routing — category taxonomy, LLM categorizer, embedding k-NN, shadow/live modes, context-aware routing, and the self-improving flywheel |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Phase history and planned work |
+
+---
+
 ## Development
 
 ```bash
