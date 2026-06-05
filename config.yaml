@@ -63,4 +63,5 @@ routing:
   embedding_model: "intfloat/multilingual-e5-small"
   embedding_k: 5
   embedding_min_pool_size: 20
-  embedding_pool_cache_ttl: 300.0    # pool cache TTL in seconds
+  embedding_pool_cache_ttl: 300.0              # pool cache TTL in seconds
+  embedding_live_confidence_threshold: 0.85    # min k-NN conf to skip LLM categorizer

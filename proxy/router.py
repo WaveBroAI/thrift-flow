@@ -764,12 +764,45 @@ class ModelRouter:
             ))
             return tier, model
 
-        # ── normal path: call categorizer ─────────────────────────────────────
+        # ── Phase 2: try embedding k-NN first (shadow or confidence-gated live) ──
+        emb_pred_category: str | None = None
+        emb_pred_confidence: float | None = None
+        _used_embedding = False   # True when k-NN result drives routing (LLM skipped)
+
         context = self._build_context(session_key) if session_key else None
 
-        category, confidence, latency_ms = await self._categorizer.categorize(
-            text, context=context
-        )
+        if self._embedder is not None:
+            # Embed query and do k-NN lookup (CPU-bound — run in thread)
+            query_emb = await asyncio.to_thread(self._embedder.embed_query, text)
+            if query_emb is not None:
+                pred_cat, pred_conf = await asyncio.to_thread(
+                    self._embedder.lookup, query_emb
+                )
+                if pred_cat != "unknown":
+                    emb_pred_category = pred_cat
+                    emb_pred_confidence = pred_conf
+                    logger.info(
+                        f"[Router] embedding_knn={pred_cat} conf={pred_conf:.2f}"
+                    )
+                    # Live mode + confidence above threshold → use k-NN, skip Groq.
+                    # Shadow mode OR low confidence → fall through to Groq below.
+                    live_threshold = self._cfg.embedding_live_confidence_threshold
+                    if (self._embedding_enabled is True
+                            and pred_conf >= live_threshold):
+                        category = pred_cat
+                        confidence = pred_conf
+                        latency_ms = None   # no LLM call was made
+                        _used_embedding = True
+                        logger.info(
+                            f"[Router] k-NN confidence {pred_conf:.2f} >= {live_threshold} "
+                            f"— skipping LLM categorizer"
+                        )
+
+        # ── LLM categorizer (runs when embedding skipped, low-confidence, or shadow) ──
+        if not _used_embedding:
+            category, confidence, latency_ms = await self._categorizer.categorize(
+                text, context=context
+            )
 
         tier = CATEGORY_TIER_MAP.get(category, "medium")
         model = self._aliases.get(tier, self._aliases.get("cheap", ""))
@@ -786,33 +819,6 @@ class ModelRouter:
         if session_key:
             self._update_context(session_key, category, tier, model, text)
 
-        # ── Phase 2: embedding shadow/live ────────────────────────────────────
-        emb_pred_category: str | None = None
-        emb_pred_confidence: float | None = None
-
-        if self._embedder is not None:
-            # Embed query and do k-NN lookup (both CPU-bound — run in thread)
-            query_emb = await asyncio.to_thread(self._embedder.embed_query, text)
-            if query_emb is not None:
-                pred_cat, pred_conf = await asyncio.to_thread(
-                    self._embedder.lookup, query_emb
-                )
-                if pred_cat != "unknown":
-                    emb_pred_category = pred_cat
-                    emb_pred_confidence = pred_conf
-                    logger.info(
-                        f"[Router] embedding_knn={pred_cat} conf={pred_conf:.2f} "
-                        f"(llm={category})"
-                    )
-                    # In live mode, override tier/model with embedding prediction.
-                    # Shadow mode (embedding_enabled == "shadow") logs only — no override.
-                    if self._embedding_enabled is True:
-                        category = pred_cat
-                        tier = CATEGORY_TIER_MAP.get(category, "medium")
-                        model = self._aliases.get(tier, self._aliases.get("cheap", ""))
-                        if not model:
-                            model = next(iter(self._aliases.values()), "")
-
         # Fire-and-forget: embed passage + write log in a single background coroutine
         # so the passage embedding is stored atomically with the routing row.
         _schedule_background(self._embed_and_log(
@@ -826,6 +832,7 @@ class ModelRouter:
             latency_ms=latency_ms,
             emb_pred_category=emb_pred_category,
             emb_pred_confidence=emb_pred_confidence,
+            source="embedding_lookup" if _used_embedding else "llm_categorizer",
         ))
 
         return tier, model
@@ -843,10 +850,13 @@ class ModelRouter:
         latency_ms: float | None,
         emb_pred_category: str | None,
         emb_pred_confidence: float | None,
+        source: str = "llm_categorizer",
     ) -> None:
         """Compute passage embedding (if pool-eligible) and write routing_log row.
 
         Runs as a fire-and-forget background task so it never blocks the response.
+        source is "embedding_lookup" when k-NN drove the routing decision (LLM skipped),
+        or "llm_categorizer" when Groq was called (shadow or low-confidence fallback).
         """
         embedding_bytes: bytes | None = None
         if pool_eligible and self._embedder is not None and isinstance(text, str) and text:
@@ -861,7 +871,7 @@ class ModelRouter:
             tier_mapping_version=self._cfg.tier_mapping_version,
             model_used=model,
             router_version=self._ROUTER_VERSION,
-            source="llm_categorizer",
+            source=source,
             category_confidence=confidence,
             pool_eligible=pool_eligible,
             prompt=prompt_for_hash,

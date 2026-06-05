@@ -47,11 +47,12 @@ class RoutingConfig:
     categorizer_timeout: float = 5.0              # LLM categorizer timeout (seconds)
     max_session_cache_size: int = 1000            # max in-process session cache entries
     # Embedding router (Phase 2)
-    embedding_enabled: bool | str = False         # False / "shadow" / True
+    embedding_enabled: bool | str = False          # False / "shadow" / True
     embedding_model: str = "intfloat/multilingual-e5-small"
     embedding_k: int = 5
     embedding_min_pool_size: int = 20
-    embedding_pool_cache_ttl: float = 300.0       # seconds
+    embedding_pool_cache_ttl: float = 300.0        # seconds
+    embedding_live_confidence_threshold: float = 0.85  # min k-NN conf to skip LLM categorizer
 
 
 @dataclass
@@ -102,6 +103,9 @@ class ProxyConfig:
             embedding_k=int(routing_raw.get("embedding_k", 5)),
             embedding_min_pool_size=int(routing_raw.get("embedding_min_pool_size", 20)),
             embedding_pool_cache_ttl=float(routing_raw.get("embedding_pool_cache_ttl", 300.0)),
+            embedding_live_confidence_threshold=float(
+                routing_raw.get("embedding_live_confidence_threshold", 0.85)
+            ),
         )
 
         return cls(server=server, models=models, tracking=tracking, routing=routing)
