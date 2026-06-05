@@ -223,6 +223,62 @@ The pool grows organically from real traffic. No manual labelling is required. T
 
 ---
 
+## Model Drift and Behavioral Consistency
+
+Adaptive routing is a cost optimization — but it comes with a behavioral trade-off that is easy to overlook.
+
+### The problem
+
+Different models have different "dialects". A model trained by one lab develops implicit shorthand in its outputs: particular phrasing, formatting habits, reasoning patterns. When an agent accumulates memory or long-running context written in that dialect, switching to a model from a different lab can cause **behavioral drift** — the new model misreads the context, ignores implicit cues, or responds in a noticeably different style.
+
+> *"The memory contained a cue like 'launch sequence #8'. The original model read that and knew exactly what to do. Others said '…launch what now?'"*
+> — [A2H Labs: Memory Speaks Only One Dialect](https://guide.a2hlabs.com/ch2-memory/#finding-04-memory-speaks-only-one-dialect)
+
+This becomes a real problem when `model: "auto"` routes some turns to cheap (e.g. GPT-4o-mini) and others to strong (e.g. Claude Sonnet). If the agent's system prompt or memory contains patterns optimised for one model's dialect, the other tier may behave inconsistently.
+
+### Recommendations
+
+**1. Use models from the same vendor across tiers.**
+
+Assign `cheap`, `medium`, and `strong` to models from the same family when behavioral consistency matters. Models within one vendor's lineup share training lineage and tend to interpret context more uniformly:
+
+```yaml
+# Consistent: all from the same vendor
+models:
+  aliases:
+    cheap:  "openai/gpt-4o-mini"
+    medium: "openai/gpt-4o"
+    strong: "openai/o1"
+
+# Riskier for agents with accumulated memory or complex personas:
+models:
+  aliases:
+    cheap:  "groq/llama-3.1-8b-instant"
+    medium: "openai/gpt-4o"
+    strong: "anthropic/claude-sonnet-4-5"
+```
+
+**2. Write agent memory and system prompts in normalized, model-agnostic language.**
+
+Avoid implicit shorthand that only one model would recognise. Prefer explicit, self-contained instructions:
+
+```
+# Fragile (model-specific shorthand):
+"Use mode 7 for analysis tasks."
+
+# Robust (self-contained):
+"When asked to summarise or compare content, use a structured bullet-point
+format with a brief conclusion at the end."
+```
+
+If you need to migrate an agent from one model to another, have the current model rewrite its accumulated memory in explicit plain language before switching — treat it like an employee handover document, not personal notes.
+
+**3. Use routing for stateless tasks first.**
+
+Routing works best for tasks that are largely self-contained per turn: casual questions, one-shot lookups, standalone coding problems. For agents with persistent personas, long-running sessions, or memory-dependent workflows, validate behavioral consistency across tiers before enabling `model: "auto"`.
+
+---
+
 ## Configuration Reference
 
 All routing settings live under `routing:` in `config.yaml`.
