@@ -7,3 +7,9 @@ tracking.db
 .env
 *.db-shm
 *.db-wal
+.claude/
+.coverage
+*.db
+dist/
+*.egg-info/
+.DS_Store
